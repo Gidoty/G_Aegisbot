@@ -1,0 +1,9 @@
+ccxt>=4.4
+pandas>=2.2
+numpy>=1.26
+fastapi>=0.115
+uvicorn>=0.30
+sqlalchemy>=2.0
+cryptography>=43.0
+python-dotenv>=1.0
+requests>=2.32
