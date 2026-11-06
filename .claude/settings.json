@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "defaultMode": "plan",
+    "deny": [
+      "Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)",
+      "Bash(cat .env*)", "Bash(ssh *)", "Bash(git push --force *)"
+    ],
+    "ask": ["Bash(git push *)"]
+  }
+}
