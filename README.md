@@ -94,6 +94,22 @@ Supabase: use the project's Postgres connection string as `AEGIS_DATABASE_URL`, 
 API can verify logins. Turn off public sign-ups in Supabase Auth and invite people instead. A login can
 use the app only if a profile exists whose `user_id` is that login's email.
 
+## Dashboard (Vercel)
+
+`dashboard/` is a Next.js 15 and Tailwind app. It talks only to the API and to Supabase Auth.
+
+1. In Vercel, import the repository and set **Root Directory** to `dashboard`.
+2. Set three environment variables (all public, none are secrets):
+   `NEXT_PUBLIC_API_URL` (your HTTPS API address), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
+3. In Supabase: turn off public sign-ups, create each person's login (their email), and add the dashboard URL
+   under Authentication > URL configuration.
+4. On the server set `AEGIS_CORS_ORIGINS` to the dashboard URL and `SUPABASE_URL` (or `SUPABASE_JWT_SECRET`).
+5. Create a profile whose user id is each person's login email: `python -m g_aegisbot.admin create-user them@example.com --days 30`.
+
+Pages: Overview (equity, daily loss limit, positions, pause), Trades, Settings (leverage, pairs, API key),
+Billing, and Admin (kill switch, users, audit, payments). Local development:
+`cd dashboard && npm install && npm run dev`; checks: `npm run typecheck && npm test && npm run build`.
+
 ## Go-live sequence (do not skip steps)
 
 1. **Check Binance is reachable** from the server: `curl -s -o /dev/null -w '%{http_code}\n' https://fapi.binance.com/fapi/v1/ping` should print `200`.
