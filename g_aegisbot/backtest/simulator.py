@@ -11,9 +11,18 @@ Bar-by-bar order (matches live timing):
   4. equity is marked at the close and the daily drawdown breaker is evaluated
   5. new signals are evaluated on this bar's close (skipped while the breaker is tripped)
 
-Known simplifications: the breaker sees hourly closes, not intrabar dips (live checks every
-minute, so it can trip earlier); funding is a constant rate, not historical; slippage is a
-flat tier assumption; liquidation uses a flat 0.5% maintenance margin.
+Warm-up: no signal is evaluated for a symbol until it has `warmup_candles` (default 500, the
+size of the live scanner's window) closed candles behind it, and none before `measure_start`.
+Warm-up bars are replayed only so indicators converge; equity, the breaker, the reported period
+and every statistic start at `measure_start`.
+
+Assumptions (also written into the report metadata, see ASSUMPTIONS):
+  * funding is a constant approximation, NOT historical Binance funding rates;
+  * liquidation is a simplified flat-maintenance-margin model, NOT an exact Binance liquidation
+    simulation (no margin brackets, liquidation fee, insurance fund or mark-price feed);
+  * slippage is a flat per-tier assumption;
+  * the breaker sees hourly closes, not intrabar dips (live checks every minute, so it can
+    trip earlier).
 """
 from __future__ import annotations
 
@@ -35,6 +44,18 @@ from g_aegisbot.engine.strategy import (
 
 MAINT_MARGIN = 0.005
 
+ASSUMPTIONS = {
+    "funding": "Constant approximation (default 0.01% per 8h charged on notional). Historical Binance "
+               "funding rates are NOT used.",
+    "liquidation": "Simplified model with a flat 0.5% maintenance margin. This is NOT an exact Binance "
+                   "liquidation simulation: no margin brackets, liquidation fee, insurance fund or mark price.",
+    "slippage": "Flat per-tier assumption (3 / 6 / 12 basis points, stop orders 1.5x). Not measured fills.",
+    "fills": "Entries fill at the next bar's open; stops are tested against bar high/low; a gap through "
+             "the stop fills at the open.",
+    "breaker": "Evaluated on hourly closes. Live checks every minute, so live can trip earlier.",
+    "fees": "Binance standard USDT-M taker fee on every order (no VIP tier or BNB discount).",
+}
+
 
 @dataclass
 class BacktestConfig:
@@ -46,6 +67,8 @@ class BacktestConfig:
     funding_rate_8h: float = FUNDING_RATE_8H
     slippage_scale: float = 1.0
     use_breaker: bool = True
+    warmup_candles: int = 500                # closed candles a symbol needs before its first signal
+    measure_start: "pd.Timestamp | str | None" = None   # first measured bar; default: bar number warmup_candles
     drawdown_limit: float = DAILY_DRAWDOWN_LIMIT
     params: StrategyParams = field(default_factory=StrategyParams)
 
@@ -91,6 +114,19 @@ class Backtester:
         self.timeline = timeline
         self.pidx = {s: i.index.get_indexer(timeline) for s, i in self.ind.items()}
 
+        if not self.ind:
+            raise ValueError("no candle data supplied")
+        ms = cfg.measure_start
+        if ms is None:
+            if len(timeline) <= cfg.warmup_candles:
+                raise ValueError(f"need more than {cfg.warmup_candles} candles to leave a measured period, "
+                                 f"got {len(timeline)}")
+            ms = timeline[cfg.warmup_candles]
+        ms = pd.Timestamp(ms)
+        self.measure_start = ms.tz_localize("UTC") if ms.tzinfo is None else ms.tz_convert("UTC")
+        if self.measure_start > timeline[-1]:
+            raise ValueError("measure_start is after the last candle")
+
     # ---- cost model
     def _fill(self, symbol: str, price: float, buying: bool, *, is_stop: bool = False) -> float:
         slip = slippage_rate(symbol, is_stop=is_stop, scale=self.cfg.slippage_scale)
@@ -107,7 +143,7 @@ class Backtester:
         positions: dict[str, _Pos] = {}
         pending: list[tuple] = []               # (signal, plan), filled at the next bar's open
         trades: list[dict] = []
-        eq_t, eq_v = [self.timeline[0]], [cfg.initial_capital]
+        eq_t, eq_v = [self.measure_start], [cfg.initial_capital]
         last_close: dict[str, float] = {}
         tracker, tripped_days, skips = None, set(), Counter()
         n = len(self.timeline)
@@ -128,6 +164,7 @@ class Backtester:
         for k in range(n):
             t = self.timeline[k]
             t_close = t + self.tf
+            measuring = t >= self.measure_start      # warm-up bars are replayed but never measured
 
             # 1. fill entries decided at the previous close
             still_pending = []
@@ -184,22 +221,24 @@ class Backtester:
                 if i >= 0:
                     last_close[s] = self.arr[s]["close"][i]
             equity = wallet + sum((last_close[s] - q.entry) * q.amount * q.dir for s, q in positions.items())
-            eq_t.append(t_close)
-            eq_v.append(equity)
+            if measuring:
+                eq_t.append(t_close)
+                eq_v.append(equity)
             tripped = False
-            if cfg.use_breaker:
+            if cfg.use_breaker and measuring:
                 tracker, event = risk.update_tracker(tracker, equity, t_close.to_pydatetime(), cfg.drawdown_limit)
                 tripped = tracker["breaker_tripped"]
                 if event == "tripped":
                     tripped_days.add(tracker["date"])
 
             # 5. signals on this bar's close
-            if tripped or k == n - 1:
+            if not measuring or tripped or k == n - 1:
                 continue
             results = []
             for s in self.ind:
                 i = self.pidx[s][k]
-                if i >= 0 and self.cand[s][i] and s not in positions and all(s != q[0].symbol for q in pending):
+                if (i >= cfg.warmup_candles and self.cand[s][i] and s not in positions
+                        and all(s != q[0].symbol for q in pending)):   # i >= 500 also excludes i == -1 (no bar)
                     results.append(evaluate_at(s, self.ind[s], int(i), p))
             for sig in rank_signals(results):
                 cap = cfg.wallet_cap if cfg.wallet_cap is not None else float("inf")
@@ -223,10 +262,20 @@ class Backtester:
             ts = [x for x in trades if x["symbol"] == s]
             by_symbol[s] = {"trades": len(ts), "net_pnl": float(sum(x["pnl"] for x in ts)),
                             "win_rate": float(np.mean([x["pnl"] > 0 for x in ts])) if ts else 0.0}
+        first_eligible = {}
+        for s, i in self.ind.items():
+            if len(i) > cfg.warmup_candles:
+                first_eligible[s] = str(max(i.index[cfg.warmup_candles], self.measure_start))
+            else:
+                first_eligible[s] = None
         notes = {
-            "data_range": {s: [str(i.index[0]), str(i.index[-1])] for s, i in self.ind.items()},
+            "measurement_period": {"start": str(self.measure_start), "end": str(self.timeline[-1] + self.tf)},
+            "warmup": {"required_candles": cfg.warmup_candles, "excluded_from_statistics": True,
+                       "first_signal_eligible": first_eligible},
+            "data_range_including_warmup": {s: [str(i.index[0]), str(i.index[-1])] for s, i in self.ind.items()},
             "breaker_trip_days": sorted(tripped_days), "skipped_signals": dict(skips),
             "assumptions": {"taker_fee": cfg.taker_fee, "funding_rate_8h": cfg.funding_rate_8h,
-                            "slippage_scale": cfg.slippage_scale, "leverage": cfg.leverage},
+                            "slippage_scale": cfg.slippage_scale, "leverage": cfg.leverage,
+                            "maintenance_margin": MAINT_MARGIN, **ASSUMPTIONS},
         }
         return BacktestResult(trades, equity_s, compute_metrics(equity_s, trades, cfg.initial_capital), by_symbol, notes)

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from g_aegisbot.backtest.data import fetch_history, load_or_download, synthetic_ohlcv
+from g_aegisbot.backtest.data import synthetic_ohlcv
 from g_aegisbot.backtest.metrics import compute_metrics, max_drawdown, sharpe_ratio
 from g_aegisbot.backtest.simulator import Backtester, BacktestConfig
 from g_aegisbot.costs import FUNDING_RATE_8H, TAKER_FEE, slippage_rate
@@ -13,11 +13,15 @@ from tests.test_strategy import make, with_breakout
 SYM = "BTC/USDT:USDT"
 
 
-def breakout_frame(extra_bars):
-    """Uptrend, a breakout on bar 399's close, then the given (open, high, low, close) bars."""
-    df = with_breakout(make(n=400))
+BASE = 520    # bars before the extras; > 500 so the 500-candle warm-up rule is satisfied
+
+
+def breakout_frame(extra_bars, base=BASE):
+    """Uptrend, a breakout on the close of bar base-1, then the given (open, high, low, close) bars."""
+    df = with_breakout(make(n=base))
     idx = pd.date_range(df.index[-1] + pd.Timedelta(hours=1), periods=len(extra_bars), freq="1h", tz="UTC")
-    extra = pd.DataFrame(extra_bars, index=idx, columns=["open", "high", "low", "close"]).assign(volume=100.0)
+    scale = df["close"].iloc[-1] / 120.9     # extras are written for a signal close of ~120.9; rescale to the real one
+    extra = pd.DataFrame(extra_bars, index=idx, columns=["open", "high", "low", "close"]).mul(scale).assign(volume=100.0)
     return pd.concat([df, extra])
 
 
@@ -61,12 +65,12 @@ def test_stop_out_costs_match_the_model_and_books_balance():
     assert len(res.trades) == 1
     t = res.trades[0]
     assert t["side"] == "buy" and t["reason"] == "stop-loss"
-    entry_open = frame["open"].iloc[400]
+    entry_open = frame["open"].iloc[BASE]
     assert t["entry_price"] == pytest.approx(entry_open * (1 + slippage_rate(SYM)))
     assert t["exit_price"] < t["entry_price"]
     assert t["fees"] == pytest.approx(TAKER_FEE * t["amount"] * (t["entry_price"] + t["exit_price"]))
     bars_held = 3                  # the stop hits inside the 4th bar, before its funding accrues
-    expected_funding = sum(t["amount"] * frame["close"].iloc[400 + j] * FUNDING_RATE_8H / 8 for j in range(bars_held))
+    expected_funding = sum(t["amount"] * frame["close"].iloc[BASE + j] * FUNDING_RATE_8H / 8 for j in range(bars_held))
     assert t["funding"] == pytest.approx(expected_funding, rel=1e-6)
     gross = (t["exit_price"] - t["entry_price"]) * t["amount"]
     assert t["pnl"] == pytest.approx(gross - t["fees"] - t["funding"])
@@ -77,7 +81,8 @@ def test_stop_out_costs_match_the_model_and_books_balance():
 def test_gap_through_stop_fills_at_open_not_at_stop():
     frame = breakout_frame([(121, 121.3, 120.8, 121.0), (90, 91, 89, 90)])    # opens far below the stop
     t = run({SYM: frame}).trades[0]
-    assert t["exit_price"] == pytest.approx(90 * (1 - slippage_rate(SYM, is_stop=True)))
+    gap_open = frame["open"].iloc[BASE + 1]
+    assert t["exit_price"] == pytest.approx(gap_open * (1 - slippage_rate(SYM, is_stop=True)))
 
 
 def test_trailing_stop_locks_in_profit():
@@ -102,7 +107,7 @@ def test_max_four_positions_in_backtest():
 
 
 def test_short_side_and_costs_symmetric():
-    down = make(n=400, up=False)
+    down = make(n=BASE, up=False)
     frame = with_breakout(down, up=False)
     idx = pd.date_range(frame.index[-1] + pd.Timedelta(hours=1), periods=3, freq="1h", tz="UTC")
     last = frame["close"].iloc[-1]
@@ -139,41 +144,6 @@ def test_slippage_scale_hurts():
     assert stress.metrics["end_equity"] < base.metrics["end_equity"] or base.metrics["trades"] == 0
 
 
-# ---- data
-class FakeEx:
-    def __init__(self, n, tf_ms=3_600_000):
-        self.rows = [[1_700_000_000_000 + i * tf_ms, 1, 2, 0.5, 1.5, 10] for i in range(n)]
-        self.calls = 0
-
-    @staticmethod
-    def parse_timeframe(tf):
-        return 3600
-
-    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=1500):
-        self.calls += 1
-        return [r for r in self.rows if r[0] >= since][:limit]
-
-
-async def test_fetch_history_pages_dedupes_and_drops_forming_candle():
-    ex = FakeEx(3200)
-    until = ex.rows[-1][0] + 1_800_000          # half-way through the last candle
-    df = await fetch_history(ex, "X", "1h", ex.rows[0][0], until, page=1500)
-    assert ex.calls >= 3 and df.index.is_unique and df.index.is_monotonic_increasing
-    assert len(df) == 3199                       # the forming candle is excluded
-
-
-async def test_cache_roundtrip(tmp_path, monkeypatch):
-    import time
-    ex = FakeEx(300)
-    now_ms = ex.rows[-1][0] + 3_600_000
-    monkeypatch.setattr(time, "time", lambda: now_ms / 1000)
-    a = await load_or_download(ex, "A/USDT:USDT", "1h", 0.01, tmp_path)
-    calls = ex.calls
-    b = await load_or_download(ex, "A/USDT:USDT", "1h", 0.01, tmp_path)
-    assert ex.calls == calls                     # second load came from the CSV cache
-    pd.testing.assert_frame_equal(a, b)
-
-
 def test_cli_synthetic_end_to_end(tmp_path, capsys):
     from g_aegisbot.backtest.__main__ import main
     main(["--synthetic", "--years", "0.5", "--symbols", "A/USDT:USDT", "B/USDT:USDT", "--out", str(tmp_path)])
@@ -181,3 +151,132 @@ def test_cli_synthetic_end_to_end(tmp_path, capsys):
     assert "SYNTHETIC" in out and "Win rate" in out and "Profit factor" in out and "Max drawdown" in out
     run_dir = next(tmp_path.iterdir())
     assert {"summary.json", "trades.csv", "equity.csv"} <= {p.name for p in run_dir.iterdir()}
+
+
+# ---- warm-up enforcement and exclusion from statistics
+def flat(n):
+    """n flat bars written for a signal close of ~120.9 (breakout_frame rescales them)."""
+    return [(120.9, 120.9, 120.9, 120.9)] * n
+
+
+def frame_breaking_out_at(k, total):
+    """A valid long breakout whose signal bar is index k, then flat bars up to `total` bars."""
+    f = breakout_frame(flat(total - (k + 1)), base=k + 1)
+    assert len(f) == total
+    return f
+
+
+def trades_for(frame, **cfg):
+    return run({SYM: frame}, **cfg)
+
+
+def test_control_breakout_inside_warmup_is_a_valid_signal_without_the_rule():
+    """Proves the warm-up tests below can fail: with a 250-candle rule this same data does trade."""
+    frame = frame_breaking_out_at(300, 700)
+    res = trades_for(frame, warmup_candles=250)
+    assert len(res.trades) == 1 and res.trades[0]["entry_time"] == frame.index[301]
+
+
+def test_no_trade_can_start_inside_the_500_candle_warmup():
+    frame = frame_breaking_out_at(300, 700)
+    assert trades_for(frame).trades == []                       # default warm-up is 500 candles
+
+
+@pytest.mark.parametrize("k,expect_trade", [(498, False), (499, False), (500, True), (501, True)])
+def test_first_signal_is_allowed_only_after_500_closed_candles(k, expect_trade):
+    frame = frame_breaking_out_at(k, k + 40)
+    assert len(trades_for(frame, warmup_candles=250).trades) == 1       # signal exists at every k
+    res = trades_for(frame, measure_start=frame.index[0])               # only the 500-candle rule can block it
+    assert len(res.trades) == (1 if expect_trade else 0)
+    if expect_trade:
+        assert res.trades[0]["entry_time"] == frame.index[k + 1]
+
+
+def test_warmup_is_counted_per_symbol_for_late_listed_pairs():
+    """A pair with fewer than 500 candles of its own history cannot trade, even late in the shared timeline."""
+    a = frame_breaking_out_at(800, 900)                                  # unrelated, long history
+    a["close"] = a["open"] = a["high"] = a["low"] = 100.0                # make A flat so it produces no signals
+    a["volume"] = 100.0
+    late = frame_breaking_out_at(449, 560)                              # only 449 bars behind its signal
+    late.index = late.index + (a.index[400] - late.index[0])            # listed 400 bars after A
+    frames = {"A/USDT:USDT": a, "LATE/USDT:USDT": late}
+    assert not [t for t in run(frames).trades if t["symbol"] == "LATE/USDT:USDT"]
+    assert [t for t in run(frames, warmup_candles=250).trades if t["symbol"] == "LATE/USDT:USDT"]   # control
+
+
+def test_signals_before_measure_start_are_ignored_even_with_enough_history():
+    frame = frame_breaking_out_at(520, 700)
+    start = frame.index[600]
+    assert len(trades_for(frame).trades) == 1                           # default measure start = bar 500: trades
+    res = trades_for(frame, measure_start=start)
+    assert res.trades == []
+
+
+def test_warmup_is_excluded_from_equity_period_and_statistics():
+    frame = frame_breaking_out_at(650, 720)
+    start = frame.index[600]
+    res = trades_for(frame, measure_start=start)
+    assert len(res.trades) == 1
+    assert all(t["entry_time"] >= start for t in res.trades)
+    assert res.equity.index[0] == start and res.equity.index.min() == start        # nothing from the warm-up
+    assert res.notes["measurement_period"]["start"] == str(start)
+    assert res.notes["measurement_period"]["end"] == str(frame.index[-1] + pd.Timedelta(hours=1))
+    assert res.notes["warmup"]["excluded_from_statistics"] is True
+    assert res.notes["warmup"]["required_candles"] == 500
+    assert res.notes["warmup"]["first_signal_eligible"][SYM] == str(start)
+    assert res.notes["data_range_including_warmup"][SYM][0] == str(frame.index[0])  # warm-up is reported separately
+    # statistics use only the measured span
+    assert len(res.equity) == 1 + (len(frame) - 600)           # opening point plus one per measured bar, none from warm-up
+    assert res.metrics["start_equity"] == 10_000
+
+
+def test_idle_measured_period_reports_zero_return_proving_warmup_has_no_pnl():
+    frame = frame_breaking_out_at(520, 700)
+    res = trades_for(frame, measure_start=frame.index[600])
+    assert res.metrics["total_return"] == 0 and res.metrics["trades"] == 0
+    assert (res.equity == 10_000).all()
+
+
+def test_too_little_data_for_a_measured_period_is_an_error():
+    with pytest.raises(ValueError, match="more than 500 candles"):
+        Backtester({SYM: make(n=400)}, BacktestConfig())
+    with pytest.raises(ValueError, match="after the last candle"):
+        Backtester({SYM: make(n=600)}, BacktestConfig(measure_start=pd.Timestamp("2100-01-01", tz="UTC")))
+
+
+# ---- assumptions are stated in the report metadata
+def test_funding_and_liquidation_are_labelled_as_assumptions():
+    res = trades_for(frame_breaking_out_at(520, 700))
+    a = res.notes["assumptions"]
+    assert "approximation" in a["funding"] and "NOT used" in a["funding"]
+    assert "NOT an exact Binance liquidation simulation" in a["liquidation"]
+    assert a["maintenance_margin"] == 0.005 and a["funding_rate_8h"] == FUNDING_RATE_8H
+
+
+def test_cli_report_states_assumptions_and_excludes_warmup(tmp_path, capsys):
+    import json
+    from g_aegisbot.backtest.__main__ import main
+    main(["--synthetic", "--years", "0.3", "--symbols", "A/USDT:USDT", "B/USDT:USDT", "--out", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "not an exact exchange simulation" in out and "NOT an exact Binance liquidation simulation" in out
+    assert "Historical Binance funding rates are NOT used" in out
+    assert "measured period only; warm-up excluded" in out and "500 closed candles required" in out
+    summary = json.loads(next(tmp_path.iterdir()).joinpath("summary.json").read_text())
+    assert "NOT an exact Binance liquidation simulation" in summary["notes"]["assumptions"]["liquidation"]
+    assert summary["notes"]["warmup"]["required_candles"] == 500
+
+
+def test_cli_aborts_without_running_when_a_required_symbol_fails(tmp_path, monkeypatch, capsys):
+    from g_aegisbot.backtest import __main__ as cli
+    from g_aegisbot.backtest.data import PortfolioDownloadError
+
+    async def fake_download_all(*a, **k):
+        raise PortfolioDownloadError({"SUI/USDT:USDT": "3 missing candle(s) in 1 gap(s)"})
+
+    monkeypatch.setattr(cli, "download_all", fake_download_all)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--years", "1", "--symbols", "SUI/USDT:USDT", "--cache-dir", str(tmp_path / "c"), "--out", str(tmp_path / "o")])
+    assert e.value.code == 2
+    err = capsys.readouterr().err
+    assert "ABORTED" in err and "SUI/USDT:USDT" in err and "3 missing candle" in err
+    assert not (tmp_path / "o").exists()                                # no backtest, no output files
