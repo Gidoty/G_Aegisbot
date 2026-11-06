@@ -99,3 +99,40 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(48))
     target: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[str | None] = mapped_column(String(400), nullable=True)
+
+
+class Payment(Base):
+    """One NOWPayments invoice. `credited` flips exactly once, when the payment is fully confirmed."""
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(96), unique=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    invoice_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payment_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="created")
+    price_usd: Mapped[float] = mapped_column(Float)
+    days: Mapped[int] = mapped_column(Integer)
+    credited: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    credited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class EquitySnapshot(Base):
+    """Account equity sampled by the runner, for the dashboard chart."""
+    __tablename__ = "equity_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    equity: Mapped[float] = mapped_column(Float)
+
+
+class Heartbeat(Base):
+    """Written by the runner so the API and dashboard can tell it is alive."""
+    __tablename__ = "heartbeats"
+
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    info: Mapped[str | None] = mapped_column(String(200), nullable=True)

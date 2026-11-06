@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import func, select
 
 from g_aegisbot import audit
+from g_aegisbot.services import extend_subscription, live_switch_problems
 from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE, MAX_LEVERAGE, MIN_LEVERAGE
 from g_aegisbot.db.models import UserProfile
 from g_aegisbot.db.repository import ProfileLimitError, ProfileRepository
@@ -252,13 +253,10 @@ class Admin:
         if a.mode == "live":
             with self.sf() as s:
                 p = self._get(s, a.user)
-                problems = []
-                if not p.has_credentials:
-                    problems.append("no API keys stored (run set-keys --verify)")
-                if float(p.max_wallet_cap_usdt or 0) <= 0:
-                    problems.append("wallet cap is 0 (run set-cap)")
-                if not a.yes_real_money:
-                    problems.append("add --yes-real-money to confirm this account will trade real funds")
+                hints = {"no API keys stored": "no API keys stored (run set-keys --verify)",
+                         "wallet cap is 0": "wallet cap is 0 (run set-cap)",
+                         "real-money confirmation missing": "add --yes-real-money to confirm this account will trade real funds"}
+                problems = [hints[x] for x in live_switch_problems(p, a.yes_real_money)]
             if problems:
                 raise AdminError("Cannot switch to live: " + "; ".join(problems) + ".")
             self.out("This account will trade REAL funds. The Binance account must be in One-way position mode, "
@@ -269,14 +267,7 @@ class Admin:
         if a.days <= 0:
             raise AdminError("--days must be positive.")
 
-        def apply(p):
-            cur = p.subscription_expires_at
-            if cur is not None and cur.tzinfo is None:        # SQLite drops the timezone
-                cur = cur.replace(tzinfo=timezone.utc)
-            base = max(self.now(), cur) if cur else self.now()
-            p.subscription_status, p.subscription_expires_at = "active", base + timedelta(days=a.days)
-
-        self._update(a.user, "extend", f"+{a.days} days", apply)
+        self._update(a.user, "extend", f"+{a.days} days", lambda p: extend_subscription(p, a.days, self.now()))
 
     def expire(self, a) -> None:
         def apply(p):

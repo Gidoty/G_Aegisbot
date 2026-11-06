@@ -369,3 +369,36 @@ async def test_fetch_stop_orders_tolerates_an_unsupported_trigger_listing_but_no
     a.exchange = SimpleNamespace(fetch_open_orders=down)
     with pytest.raises(ccxt.RequestTimeout):
         await a.fetch_stop_orders("X")
+
+
+# ------------------------------------------------------------------ dashboard data written by the runner
+async def test_runner_samples_equity_every_five_minutes_and_writes_a_heartbeat(world):
+    from g_aegisbot.db.trading_models import EquitySnapshot, Heartbeat
+    r = world["runner"]
+    quiet_1m(world)
+    await r.start()
+    await r.risk_pass()
+    await r.risk_pass()                                              # same minute: no second sample
+    with world["sf"]() as s:
+        assert len(list(s.scalars(select(EquitySnapshot)))) == 1
+        beat = s.get(Heartbeat, "runner")
+        assert beat is not None and beat.info == "risk pass ok"
+    world["clock"].now += timedelta(minutes=5, seconds=1)
+    await r.risk_pass()
+    with world["sf"]() as s:
+        snaps = list(s.scalars(select(EquitySnapshot).order_by(EquitySnapshot.id)))
+    assert len(snaps) == 2 and snaps[0].equity == pytest.approx(10_000)
+
+
+async def test_old_equity_samples_are_pruned(world):
+    from g_aegisbot.db.trading_models import EquitySnapshot
+    old = world["clock"].now - timedelta(days=120)
+    with world["sf"]() as s:
+        s.add(EquitySnapshot(user_id="alice", at=old, equity=1.0))
+        s.commit()
+    r = world["runner"]
+    quiet_1m(world)
+    await r.start()
+    await r.risk_pass()
+    with world["sf"]() as s:
+        assert [x.equity for x in s.scalars(select(EquitySnapshot))] == [pytest.approx(10_000)]

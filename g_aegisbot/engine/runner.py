@@ -22,6 +22,7 @@ import pandas as pd
 
 from g_aegisbot.config import DAILY_DRAWDOWN_LIMIT
 from g_aegisbot.db.models import UserProfile
+from g_aegisbot.db.trading_models import EquitySnapshot, Heartbeat
 from g_aegisbot.engine import risk
 from g_aegisbot.engine.controls import ControlState, ControlStore
 from g_aegisbot.engine.paper import PaperExchange
@@ -63,6 +64,8 @@ class TradingRunner:
         self._adapters: dict[str, tuple] = {}
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._universe: tuple[str, ...] = ()
+        self._last_snapshot: dict[str, datetime] = {}
+        self._last_prune: str | None = None
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------ setup
@@ -132,11 +135,44 @@ class TradingRunner:
         if event or tracker != profile.daily_loss_tracker:
             await asyncio.to_thread(self._save_tracker, profile.user_id, tracker)
         profile.daily_loss_tracker = tracker
+        await self._record_equity(profile.user_id, equity, now)
         if event == "tripped":
             log.warning(risk.trip_message(profile.user_id, tracker, equity, now, self.limit))
         elif event == "new_day":
             log.info(risk.new_day_message(profile.user_id, tracker))
         return tracker
+
+    # ------------------------------------------------------------------ dashboard data
+    def _write_snapshot(self, uid: str, equity: float, now: datetime, prune: bool) -> None:
+        from sqlalchemy import delete
+        with self.sf() as s:
+            s.add(EquitySnapshot(user_id=uid, at=now, equity=equity))
+            if prune:
+                s.execute(delete(EquitySnapshot).where(EquitySnapshot.at < now - timedelta(days=90)))
+            s.commit()
+
+    async def _record_equity(self, uid: str, equity: float, now: datetime) -> None:
+        """Sample equity at most every 5 minutes per user; keep 90 days."""
+        last = self._last_snapshot.get(uid)
+        if last is not None and (now - last).total_seconds() < 300:
+            return
+        self._last_snapshot[uid] = now
+        today = risk.utc_date(now)
+        prune, self._last_prune = self._last_prune != today, today
+        await asyncio.to_thread(self._write_snapshot, uid, float(equity), now, prune)
+
+    def _write_heartbeat(self, info: str) -> None:
+        with self.sf() as s:
+            row = s.get(Heartbeat, "runner") or Heartbeat(name="runner", at=self.clock())
+            row.at, row.info = self.clock(), info[:200]
+            s.merge(row)
+            s.commit()
+
+    async def _beat(self, info: str) -> None:
+        try:
+            await asyncio.to_thread(self._write_heartbeat, info)
+        except Exception:
+            log.exception("could not write the heartbeat")
 
     async def risk_pass(self) -> None:
         for profile in await asyncio.to_thread(self._load_profiles):
@@ -166,6 +202,7 @@ class TradingRunner:
                         await self._ensure_protected(profile, adapter)
                 except Exception:
                     log.exception("[%s] safety check failed", profile.user_id)
+        await self._beat("risk pass ok")
 
     # ------------------------------------------------------------------ candle cycle
     async def run_cycle(self, allow_entries: bool = True) -> None:
@@ -189,6 +226,7 @@ class TradingRunner:
         log.info("Scan done: %d pairs, %d signals %s; rejected: %s", len(results), len(signals),
                  [f"{s.symbol} {s.side} {s.conviction}" for s in signals], rejected)
         await asyncio.gather(*(self._manage_user(p, signals, allow_entries) for p in profiles))
+        await self._beat(f"candle cycle ok, {len(signals)} signal(s)")
 
     async def _manage_user(self, profile: UserProfile, signals, allow_entries: bool) -> None:
         async with self._locks[profile.user_id]:
