@@ -15,7 +15,7 @@ def test_defaults(session, box):
     assert p.trading_mode == "testnet"
     assert p.virtual_balance == Decimal("50000")
     assert p.leverage == 3
-    assert len(p.active_coins) == 15 == len(DEFAULT_COINS)
+    assert p.active_coins == list(DEFAULT_COINS)
     assert p.subscription_status == "expired"
     assert p.daily_loss_tracker["breaker_tripped"] is False
 
@@ -50,7 +50,7 @@ def test_leverage_bounds(session, box):
 def test_coin_validation(session, box):
     p = ProfileRepository(session, box).create("a")
     with pytest.raises(ValueError):
-        p.active_coins = list(DEFAULT_COINS) + ["SUI/USDT:USDT"]
+        p.active_coins = [f"C{i}/USDT:USDT" for i in range(16)]
     with pytest.raises(ValueError):
         p.active_coins = ["BTC/USDT"]  # spot format
     with pytest.raises(ValueError):

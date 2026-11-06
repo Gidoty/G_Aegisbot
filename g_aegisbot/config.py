@@ -17,11 +17,13 @@ DEFAULT_LEVERAGE = 3
 MAX_LEVERAGE = 5
 DEFAULT_TESTNET_BALANCE = Decimal("50000")
 
-# Default watchlist: 15 liquid USDT-margined perpetuals in CCXT unified symbol format.
+# Default watchlist, CCXT unified symbols for Binance USDT-M perpetuals.
+# PEPE trades as 1000PEPE on Binance Futures (price is quoted per 1000 tokens).
+# The scanner re-checks every symbol against live markets at startup and drops unknown ones.
 DEFAULT_COINS: tuple[str, ...] = (
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT",
-    "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-    "LTC/USDT:USDT", "TRX/USDT:USDT", "NEAR/USDT:USDT", "ATOM/USDT:USDT", "APT/USDT:USDT",
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT",
+    "LINK/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "NEAR/USDT:USDT", "SUI/USDT:USDT",
+    "DOGE/USDT:USDT", "FET/USDT:USDT", "1000PEPE/USDT:USDT", "RENDER/USDT:USDT",
 )
 
 
