@@ -34,6 +34,9 @@ COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 DAY_MS = 86_400_000
 WARMUP_CANDLES = 500        # closed candles required before the first signal is evaluated
 WARMUP_MIN_DAYS = 25        # extra history downloaded before the measured period
+# Binance USDT-M futures returns at most 1,000 klines per request, even when a larger `limit` is asked
+# for (confirmed against the live exchange). The page budget below must use this real size.
+BINANCE_FUTURES_PAGE_LIMIT = 1000
 
 
 # --------------------------------------------------------------------------- errors
@@ -219,14 +222,21 @@ async def with_retries(call, *, symbol: str, retries: int = 5, base_delay: float
             await sleep(delay)
 
 
-async def fetch_rows(exchange, symbol: str, w: Window, *, page: int = 1500, retries: int = 5,
+async def fetch_rows(exchange, symbol: str, w: Window, *, page: int = BINANCE_FUTURES_PAGE_LIMIT, retries: int = 5,
                      base_delay: float = 1.0, sleep=asyncio.sleep) -> list[list]:
-    """Page through fetch_ohlcv over [expected_first, end). Returns raw rows, unmodified."""
+    """Page through fetch_ohlcv over [expected_first, end). Returns raw rows, unmodified.
+
+    The cursor always moves to just after the newest candle actually returned, so a server that returns
+    fewer rows than requested is handled. The page budget assumes the exchange's real page size, never
+    more than BINANCE_FUTURES_PAGE_LIMIT, so asking for a bigger `limit` cannot shrink the budget."""
     since, rows = w.expected_first, []
-    max_pages = math.ceil((w.end_ms - since) / (w.tf_ms * page)) + 5
-    for _ in range(max_pages):
-        if since >= w.end_ms:
-            return rows
+    per_page = min(page, BINANCE_FUTURES_PAGE_LIMIT)
+    max_pages = math.ceil((w.end_ms - since) / (w.tf_ms * per_page)) + 5
+    requests = 0
+    while since < w.end_ms:
+        if requests >= max_pages:            # the budget counts requests; finishing never costs an extra one
+            raise DataIntegrityError(symbol, [f"gave up after {max_pages} pages without reaching {fmt_ms(w.end_ms)}"])
+        requests += 1
         batch = await with_retries(
             lambda s=since: exchange.fetch_ohlcv(symbol, w.timeframe, since=s, limit=page),
             symbol=symbol, retries=retries, base_delay=base_delay, sleep=sleep)
@@ -239,7 +249,7 @@ async def fetch_rows(exchange, symbol: str, w: Window, *, page: int = 1500, retr
                 f"newest candle returned is {fmt_ms(newest)}"])
         rows.extend(r for r in batch if int(r[0]) < w.end_ms)
         since = newest + w.tf_ms
-    raise DataIntegrityError(symbol, [f"gave up after {max_pages} pages without reaching {fmt_ms(w.end_ms)}"])
+    return rows
 
 
 async def download_symbol(exchange, symbol: str, w: Window, *, allow_late_start: bool = False, **kw
