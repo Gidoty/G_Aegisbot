@@ -87,3 +87,15 @@ class Control(Base):
     reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
     set_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class AuditLog(Base):
+    """Who changed what. Never stores secrets."""
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    actor: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(48))
+    target: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(400), nullable=True)
