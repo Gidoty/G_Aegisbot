@@ -394,7 +394,9 @@ def create_app_from_env() -> FastAPI:
     from g_aegisbot.db import get_engine, get_session_factory, init_db
     from g_aegisbot.security.crypto import SecretBox
 
+    from g_aegisbot.migrate import ensure_schema
+
     engine = get_engine()
-    init_db(engine)
+    ensure_schema(engine)
     box = SecretBox.from_env()
     return create_app(load_api_settings(), get_session_factory(engine), box)

@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init-db", help="create missing tables (safe to repeat)")
     sub.add_parser("gen-key", help="print a new encryption key for AEGIS_MASTER_KEYS")
+    sub.add_parser("migrate", help="bring the database schema up to date (required on Postgres)")
     sub.add_parser("list", help="one line per profile")
     sub.add_parser("status", help="kill-switch state, profiles, open trades")
     sub.add_parser("rotate-keys", help="re-encrypt every stored API key with the newest master key")
@@ -130,8 +131,17 @@ class Admin:
     # ------------------------------------------------------------ commands
     def init_db(self, a) -> None:
         from g_aegisbot.db import init_db
-        init_db(self.sf.kw["bind"])
+        engine = self.sf.kw["bind"]
+        if engine.dialect.name != "sqlite":
+            raise AdminError("init-db is for local SQLite only. On Postgres run 'migrate', which applies the "
+                             "versioned schema and the row-level-security lockdown.")
+        init_db(engine)
         self.out("Database tables are in place.")
+
+    def migrate(self, a) -> None:
+        from g_aegisbot.migrate import upgrade
+        rev = upgrade(self.sf.kw["bind"])
+        self.out(f"Database schema is at revision {rev}.")
 
     def gen_key(self, a) -> None:
         self.out(generate_key())
@@ -329,7 +339,7 @@ def _default_verify(key: str, secret: str):
 
 
 COMMANDS = {
-    "init-db": "init_db", "gen-key": "gen_key", "create-user": "create_user", "list": "list", "show": "show",
+    "init-db": "init_db", "migrate": "migrate", "gen-key": "gen_key", "create-user": "create_user", "list": "list", "show": "show",
     "set-keys": "set_keys", "set-cap": "set_cap", "set-balance": "set_balance", "set-leverage": "set_leverage",
     "set-coins": "set_coins", "set-mode": "set_mode", "extend": "extend", "expire": "expire", "kill": "kill",
     "resume": "resume", "status": "status", "rotate-keys": "rotate_keys", "audit": "audit_cmd",
@@ -350,8 +360,11 @@ def main(argv: list[str] | None = None) -> None:
     from g_aegisbot.config import get_settings
     from g_aegisbot.db import get_engine, get_session_factory, init_db
 
+    from g_aegisbot.migrate import ensure_schema
+
     engine = get_engine()
-    init_db(engine)
+    if not (argv or sys.argv[1:] or [""])[0] == "migrate":
+        ensure_schema(engine)
     settings = get_settings()
     box = SecretBox(settings.master_keys) if settings.master_keys else None
     sys.exit(run(sys.argv[1:] if argv is None else argv, Admin(get_session_factory(engine), box)))

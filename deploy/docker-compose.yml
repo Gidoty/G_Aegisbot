@@ -1,0 +1,26 @@
+# From the repository root:  docker compose -f deploy/docker-compose.yml up -d --build
+# Create .env first (copy .env.example). Run migrations before the first start:
+#   docker compose -f deploy/docker-compose.yml run --rm runner python -m g_aegisbot.admin migrate
+services:
+  runner:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: python -m g_aegisbot.engine.runner
+    env_file: ../.env
+    restart: unless-stopped
+    stop_grace_period: 60s
+    volumes: ["../data:/app/data"]
+
+  api:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: >
+      uvicorn --factory g_aegisbot.api.app:create_app_from_env
+      --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips "*"
+    env_file: ../.env
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]      # reachable only from this machine; put Caddy/nginx in front for HTTPS
+    volumes: ["../data:/app/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

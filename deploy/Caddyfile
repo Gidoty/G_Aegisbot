@@ -1,0 +1,5 @@
+# HTTPS reverse proxy for the API. Replace the domain; Caddy obtains the certificate automatically.
+# NOWPayments must reach https://api.example.com/api/billing/nowpayments/ipn
+api.example.com {
+    reverse_proxy 127.0.0.1:8000
+}

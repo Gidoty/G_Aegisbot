@@ -516,7 +516,10 @@ def main(argv: list[str] | None = None) -> None:
     from g_aegisbot.db import get_session_factory, init_db
     from g_aegisbot.security.crypto import SecretBox
 
-    init_db()
+    from g_aegisbot.db import get_engine
+    from g_aegisbot.migrate import ensure_schema
+
+    ensure_schema(get_engine())
     runner = TradingRunner(get_session_factory(), SecretBox.from_env(), dry_run=args.dry_run)
 
     async def _main() -> None:
