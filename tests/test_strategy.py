@@ -150,10 +150,11 @@ class FakeAdapter:
         self.calls.append(("stop", side, amt, price)); return {"id": "s"}
 
 
-def profile(cap=Decimal("5000"), active=True, tripped=False):
+def profile(cap=Decimal("5000"), active=True, tripped=False, leverage=3):
     exp = datetime.now(timezone.utc) + timedelta(days=5)
     return SimpleNamespace(
         max_wallet_cap_usdt=cap,
+        leverage=leverage,
         daily_loss_tracker={"breaker_tripped": tripped},
         subscription_is_active=lambda: active,
     )
@@ -262,4 +263,18 @@ async def test_scanner_isolates_errors_drops_forming_candle_and_ranks():
 
 
 def test_default_symbols():
-    assert len(ELITE_SYMBOLS) == 14 and "1000PEPE/USDT:USDT" in ELITE_SYMBOLS
+    assert len(ELITE_SYMBOLS) == 15 and "1000PEPE/USDT:USDT" in ELITE_SYMBOLS
+
+
+async def test_profile_leverage_drives_sizing():
+    p1 = await plan_trade(profile(leverage=1), FakeAdapter(), signal(0.06), P)
+    p5 = await plan_trade(profile(leverage=5), FakeAdapter(), signal(0.06), P)
+    assert p1.leverage == 1 and p5.leverage == 5
+    assert p5.notional == pytest.approx(p1.notional * 5, rel=0.02)
+
+
+async def test_wide_stop_blocked_at_high_leverage_only():
+    wide = replace(signal(0.06), stop_price=50_000.0 * 0.88)   # 12% stop
+    assert isinstance(await plan_trade(profile(leverage=3), FakeAdapter(), wide, P), TradePlan)
+    r = await plan_trade(profile(leverage=5), FakeAdapter(), wide, P)
+    assert isinstance(r, Skip) and "liquidation" in r.reason

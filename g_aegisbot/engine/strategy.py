@@ -17,7 +17,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE
+from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE, MAX_LEVERAGE, MIN_LEVERAGE
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +239,13 @@ async def plan_trade(profile, adapter, sig: Signal, p: StrategyParams = Strategy
     if await adapter.fetch_open_positions([sym]):
         return Skip(sym, "position already open")
 
+    leverage = int(getattr(profile, "leverage", None) or p.leverage)
+    if not MIN_LEVERAGE <= leverage <= MAX_LEVERAGE:
+        return Skip(sym, f"leverage {leverage}x outside {MIN_LEVERAGE}-{MAX_LEVERAGE}x")
+    stop_pct = abs(sig.entry_price - sig.stop_price) / sig.entry_price
+    if stop_pct > 0.5 / leverage:  # keep the stop well inside the liquidation distance
+        return Skip(sym, f"stop {stop_pct:.1%} too close to liquidation at {leverage}x")
+
     bal = await adapter.fetch_usdt_balance()
     allocated = min(cap, bal["total"])
     margin = allocated * sig.size_pct
@@ -249,7 +256,7 @@ async def plan_trade(profile, adapter, sig: Signal, p: StrategyParams = Strategy
     if bal["free"] < margin * p.margin_buffer:
         return Skip(sym, f"insufficient free margin ({bal['free']:.2f} < {margin * p.margin_buffer:.2f})")
 
-    notional = margin * p.leverage
+    notional = margin * leverage
     ex = adapter.exchange
     market = ex.markets.get(sym) if ex.markets else None
     amount = float(ex.amount_to_precision(sym, notional / sig.entry_price))
@@ -264,8 +271,8 @@ async def plan_trade(profile, adapter, sig: Signal, p: StrategyParams = Strategy
             return Skip(sym, f"below min notional {min_cost}")
 
     risk = amount * abs(sig.entry_price - sig.stop_price)
-    return TradePlan(sym, sig.side, amount, sig.entry_price, sig.stop_price, p.leverage,
-                     amount * sig.entry_price / p.leverage, amount * sig.entry_price, risk,
+    return TradePlan(sym, sig.side, amount, sig.entry_price, sig.stop_price, leverage,
+                     amount * sig.entry_price / leverage, amount * sig.entry_price, risk,
                      sig.conviction, sig.size_pct)
 
 

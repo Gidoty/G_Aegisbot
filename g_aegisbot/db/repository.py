@@ -7,7 +7,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from g_aegisbot.config import MAX_PROFILES
+from g_aegisbot.config import DEFAULT_TESTNET_BALANCE, MAX_PROFILES
 from g_aegisbot.db.models import UserProfile
 from g_aegisbot.security.crypto import SecretBox
 
@@ -33,6 +33,10 @@ class ProfileRepository:
     def create(self, user_id: str, *, is_admin: bool = False, **fields) -> UserProfile:
         if self.count() >= MAX_PROFILES:
             raise ProfileLimitError(f"Profile limit reached ({MAX_PROFILES}).")
+        # Live profiles start with cap 0 (trading blocked until you set a cap on purpose).
+        # Testnet profiles default the cap to their reference balance so paper trading works at once.
+        if fields.get("trading_mode", "testnet") == "testnet" and "max_wallet_cap_usdt" not in fields:
+            fields["max_wallet_cap_usdt"] = fields.get("virtual_balance", DEFAULT_TESTNET_BALANCE)
         profile = UserProfile(user_id=user_id, is_admin=is_admin, **fields)
         self.session.add(profile)
         self.session.commit()

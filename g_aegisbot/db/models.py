@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Integer, Numeric, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -17,6 +18,11 @@ from g_aegisbot.config import (
     MIN_LEVERAGE,
 )
 from g_aegisbot.db.base import Base
+
+
+def _json():
+    """A fresh JSON type per column (mutable wrappers attach to the type instance)."""
+    return JSON().with_variant(JSONB(), "postgresql")
 
 
 def _utcnow() -> datetime:
@@ -56,7 +62,7 @@ class UserProfile(Base):
     )
     max_wallet_cap_usdt: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0"))
     active_coins: Mapped[list] = mapped_column(
-        MutableList.as_mutable(JSON), default=lambda: list(DEFAULT_COINS)
+        MutableList.as_mutable(_json()), default=lambda: list(DEFAULT_COINS)
     )
     leverage: Mapped[int] = mapped_column(Integer, default=DEFAULT_LEVERAGE)
 
@@ -66,7 +72,7 @@ class UserProfile(Base):
     )
     # {"date": "YYYY-MM-DD" (UTC), "start_equity", "realized_pnl", "breaker_tripped"}
     daily_loss_tracker: Mapped[dict] = mapped_column(
-        MutableDict.as_mutable(JSON), default=_default_loss_tracker
+        MutableDict.as_mutable(_json()), default=_default_loss_tracker
     )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

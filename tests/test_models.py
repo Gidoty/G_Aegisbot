@@ -13,11 +13,17 @@ def test_defaults(session, box):
     p = ProfileRepository(session, box).create("alice")
     assert p.market_type == "futures"
     assert p.trading_mode == "testnet"
-    assert p.virtual_balance == Decimal("50000")
+    assert p.virtual_balance == Decimal("10000")
     assert p.leverage == 3
     assert p.active_coins == list(DEFAULT_COINS)
     assert p.subscription_status == "expired"
     assert p.daily_loss_tracker["breaker_tripped"] is False
+
+
+def test_testnet_cap_defaults_to_reference_balance_live_is_blocked(session, box):
+    repo = ProfileRepository(session, box)
+    assert repo.create("t").max_wallet_cap_usdt == Decimal("10000")
+    assert repo.create("l", trading_mode="live").max_wallet_cap_usdt == Decimal("0")
 
 
 def test_credentials_encrypted_at_rest(session, box):
@@ -42,7 +48,8 @@ def test_leverage_bounds(session, box):
     repo = ProfileRepository(session, box)
     p = repo.create("a")
     p.leverage = 5
-    for bad in (2, 6, 10):
+    p.leverage = 1
+    for bad in (0, 6, 10):
         with pytest.raises(ValueError):
             p.leverage = bad
 
