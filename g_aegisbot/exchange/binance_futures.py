@@ -60,8 +60,10 @@ class BinanceFuturesAdapter:
             if s not in markets or not markets[s].get("swap") or not markets[s].get("linear")
         ]
 
-    async def fetch_ohlcv_df(self, symbol: str, timeframe: str = "15m", limit: int = 500) -> pd.DataFrame:
-        raw = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    async def fetch_ohlcv_df(
+        self, symbol: str, timeframe: str = "15m", limit: int = 500, since: int | None = None
+    ) -> pd.DataFrame:
+        raw = await self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
         df = pd.DataFrame(raw, columns=OHLCV_COLUMNS)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df.set_index("timestamp")
@@ -75,6 +77,14 @@ class BinanceFuturesAdapter:
             "free": float(usdt.get("free") or 0),
             "used": float(usdt.get("used") or 0),
         }
+
+    async def fetch_equity(self) -> float:
+        """Margin balance = wallet balance + unrealized PnL, from Binance's account endpoint."""
+        acct = await self.exchange.fapiPrivateV2GetAccount()
+        return float(acct["totalMarginBalance"])
+
+    async def fetch_last_price(self, symbol: str) -> float:
+        return float((await self.exchange.fetch_ticker(symbol))["last"])
 
     async def fetch_open_positions(self, symbols: list[str] | None = None) -> list[dict]:
         positions = await self.exchange.fetch_positions(symbols)
@@ -103,6 +113,12 @@ class BinanceFuturesAdapter:
             symbol, "STOP_MARKET", side, amount, None,
             {"stopPrice": stop_price, "reduceOnly": True, "workingType": "MARK_PRICE"},
         )
+
+    async def cancel_order(self, symbol: str, order_id: str) -> None:
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+        except ccxt.OrderNotFound:
+            pass  # already filled or cancelled
 
     async def cancel_all(self, symbol: str) -> None:
         await self.exchange.cancel_all_orders(symbol)

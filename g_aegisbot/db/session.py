@@ -66,7 +66,7 @@ def postgres_lockdown_sql(tables) -> list[str]:
 
 
 def init_db(engine: Engine | None = None) -> None:
-    from g_aegisbot.db import models  # noqa: F401  (register tables)
+    from g_aegisbot.db import models, trading_models  # noqa: F401  (register tables)
 
     engine = engine or get_engine()
     Base.metadata.create_all(engine)

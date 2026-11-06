@@ -208,7 +208,7 @@ async def test_allocation_headroom_limits_total_exposure():
 
 
 async def test_open_position_skips():
-    r = await plan_trade(profile(), FakeAdapter(positions=[{"contracts": 1}]), signal(), P)
+    r = await plan_trade(profile(), FakeAdapter(positions=[{"symbol": "BTC/USDT:USDT", "contracts": 1}]), signal(), P)
     assert isinstance(r, Skip) and "already open" in r.reason
 
 
@@ -278,3 +278,23 @@ async def test_wide_stop_blocked_at_high_leverage_only():
     assert isinstance(await plan_trade(profile(leverage=3), FakeAdapter(), wide, P), TradePlan)
     r = await plan_trade(profile(leverage=5), FakeAdapter(), wide, P)
     assert isinstance(r, Skip) and "liquidation" in r.reason
+
+
+async def test_risk_per_trade_is_capped_at_1_5_percent_of_allocation():
+    wide = replace(signal(0.135), stop_price=50_000.0 * 0.90)       # 10% stop, high-conviction size
+    plan = await plan_trade(profile(), FakeAdapter(), wide, P)
+    assert isinstance(plan, TradePlan) and plan.risk_capped
+    assert plan.risk_usdt <= 5000 * 0.015 + 1e-6                     # allocation is 5000 (the cap)
+    assert plan.risk_usdt > 5000 * 0.015 * 0.95                      # trimmed to the limit, not far below it
+
+
+async def test_small_risk_trade_is_not_trimmed():
+    plan = await plan_trade(profile(), FakeAdapter(), signal(0.06), P)   # 3% stop: risk 0.54% of allocation
+    assert not plan.risk_capped
+
+
+async def test_max_four_concurrent_positions():
+    others = [{"symbol": f"C{i}/USDT:USDT", "contracts": 1} for i in range(3)]
+    assert isinstance(await plan_trade(profile(), FakeAdapter(positions=others), signal(), P), TradePlan)   # 4th is allowed
+    r = await plan_trade(profile(), FakeAdapter(positions=others + [{"symbol": "X/USDT:USDT", "contracts": 1}]), signal(), P)
+    assert isinstance(r, Skip) and "max 4 open positions" in r.reason

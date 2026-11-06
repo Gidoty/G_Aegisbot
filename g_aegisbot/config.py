@@ -16,6 +16,10 @@ MIN_LEVERAGE = 1
 DEFAULT_LEVERAGE = 3
 MAX_LEVERAGE = 5
 # Reference figure only. Testnet trading uses whatever balance the exchange reports.
+# Risk limits (per user account)
+MAX_OPEN_POSITIONS = 4
+MAX_RISK_PER_TRADE = 0.015      # max loss at the initial stop, as a share of allocated capital
+DAILY_DRAWDOWN_LIMIT = 0.04     # halt new entries after a 4% loss within one UTC day
 DEFAULT_TESTNET_BALANCE = Decimal("10000")
 
 # Default watchlist, CCXT unified symbols for Binance USDT-M perpetuals.

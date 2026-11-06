@@ -30,7 +30,7 @@ def _utcnow() -> datetime:
 
 
 def _default_loss_tracker() -> dict:
-    return {"date": None, "start_equity": None, "realized_pnl": 0.0, "breaker_tripped": False}
+    return {"date": None, "start_equity": None, "pnl": 0.0, "loss_pct": 0.0, "breaker_tripped": False, "tripped_at": None}
 
 
 class UserProfile(Base):
@@ -70,7 +70,7 @@ class UserProfile(Base):
     subscription_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # {"date": "YYYY-MM-DD" (UTC), "start_equity", "realized_pnl", "breaker_tripped"}
+    # {"date": "YYYY-MM-DD" (UTC), "start_equity", "pnl", "loss_pct", "breaker_tripped", "tripped_at"}
     daily_loss_tracker: Mapped[dict] = mapped_column(
         MutableDict.as_mutable(_json()), default=_default_loss_tracker
     )
