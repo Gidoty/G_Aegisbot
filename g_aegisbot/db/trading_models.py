@@ -75,3 +75,15 @@ class PaperPosition(Base):
     stop_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     next_check_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))   # first 1m candle still to scan for stop hits
+
+
+class Control(Base):
+    """Kill switch. One row per scope: 'global' (everyone) or a user_id. flatten implies paused."""
+    __tablename__ = "controls"
+
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    paused: Mapped[bool] = mapped_column(default=False)
+    flatten: Mapped[bool] = mapped_column(default=False)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    set_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

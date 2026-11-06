@@ -135,6 +135,17 @@ class PaperExchange:
             s.commit()
             return {"id": pos.stop_order_id, "stopPrice": stop_price}
 
+    async def fetch_stop_orders(self, symbol: str) -> list[dict]:
+        with self.sf() as s:
+            pos = s.scalar(select(PaperPosition).where(
+                PaperPosition.user_id == self.user_id, PaperPosition.symbol == symbol))
+        if pos is None or pos.stop_price is None:
+            return []
+        return [{"id": pos.stop_order_id, "stopPrice": pos.stop_price, "side": "sell" if pos.side == "buy" else "buy"}]
+
+    async def assert_one_way_mode(self) -> None:
+        return None
+
     async def cancel_order(self, symbol: str, order_id: str) -> None:
         with self.sf() as s:
             pos = s.scalar(select(PaperPosition).where(

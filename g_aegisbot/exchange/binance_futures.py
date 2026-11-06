@@ -9,6 +9,10 @@ from g_aegisbot.config import MAX_LEVERAGE, MIN_LEVERAGE
 OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
+class PositionModeError(Exception):
+    """The Binance account is in hedge mode; the bot only supports one-way mode."""
+
+
 class BinanceFuturesAdapter:
     def __init__(
         self,
@@ -113,6 +117,37 @@ class BinanceFuturesAdapter:
             symbol, "STOP_MARKET", side, amount, None,
             {"stopPrice": stop_price, "reduceOnly": True, "workingType": "MARK_PRICE"},
         )
+
+    async def fetch_stop_orders(self, symbol: str) -> list[dict]:
+        """Open reduce-only stop orders for a symbol: [{'id', 'stopPrice', 'side'}].
+        Binance has been moving conditional orders to a separate service, so both the normal and the
+        trigger-order listings are queried and merged. Confirm on the VPS with the self-test tool."""
+        found: dict[str, dict] = {}
+        for params in ({}, {"trigger": True}):
+            try:
+                orders = await self.exchange.fetch_open_orders(symbol, params=params)
+            except ccxt.NetworkError:
+                raise
+            except ccxt.ExchangeError:
+                if not params:
+                    raise
+                continue
+            for o in orders:
+                kind = str(o.get("type") or "").lower().replace("_", "")
+                info = o.get("info") or {}
+                if "stop" not in kind or not (o.get("reduceOnly") or str(info.get("closePosition")).lower() == "true"):
+                    continue
+                price = o.get("stopPrice") or o.get("triggerPrice") or info.get("stopPrice") or info.get("triggerPrice")
+                if price is not None:
+                    found[str(o["id"])] = {"id": str(o["id"]), "stopPrice": float(price), "side": o.get("side")}
+        return list(found.values())
+
+    async def assert_one_way_mode(self) -> None:
+        """Refuse hedge mode: reduce-only orders and our position tracking assume one-way mode."""
+        resp = await self.exchange.fapiPrivateGetPositionSideDual()
+        if str(resp.get("dualSidePosition")).lower() == "true":
+            raise PositionModeError("This Binance account uses Hedge Mode. Switch it to One-way Mode "
+                                    "(Futures > Preferences > Position Mode) with no open positions, then restart.")
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
         try:
