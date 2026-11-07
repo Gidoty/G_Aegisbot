@@ -18,10 +18,12 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import func, select
 
 from g_aegisbot import audit
-from g_aegisbot.services import extend_subscription, live_switch_problems
+from g_aegisbot.services import (
+    KEYS_FUTURE, KEYS_MISSING, KEYS_STALE, KEYS_UNREADABLE, extend_subscription, live_switch_problems,
+)
 from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE, MAX_LEVERAGE, MIN_LEVERAGE
 from g_aegisbot.db.models import UserProfile
-from g_aegisbot.db.repository import ProfileLimitError, ProfileRepository
+from g_aegisbot.db.repository import LIVE_CREATION_MESSAGE, LiveCreationError, ProfileLimitError, ProfileRepository
 from g_aegisbot.db.trading_models import OpenTrade
 from g_aegisbot.engine.controls import GLOBAL, ControlStore
 from g_aegisbot.security.crypto import SecretBox, generate_key
@@ -154,8 +156,11 @@ class Admin:
         self.out("Database tables are in place.")
 
     def migrate(self, a) -> None:
-        from g_aegisbot.migrate import upgrade
-        rev = upgrade(self.sf.kw["bind"])
+        from g_aegisbot.migrate import SchemaInconsistent, upgrade
+        try:
+            rev = upgrade(self.sf.kw["bind"])
+        except SchemaInconsistent as exc:
+            raise AdminError(str(exc))
         self.out(f"Database schema is at revision {rev}.")
 
     def gen_key(self, a) -> None:
@@ -165,6 +170,8 @@ class Admin:
                  "then run 'rotate-keys'.")
 
     def create_user(self, a) -> None:
+        if a.mode != "testnet":            # checked before anything is written; never converted to a paper account silently
+            raise AdminError(LIVE_CREATION_MESSAGE if a.mode == "live" else f"unknown trading mode {a.mode!r}.")
         fields = {"trading_mode": a.mode, "leverage": a.leverage}
         if a.cap is not None:
             fields["max_wallet_cap_usdt"] = a.cap
@@ -172,8 +179,6 @@ class Admin:
             fields["virtual_balance"] = a.balance
         if a.coins:
             fields["active_coins"] = a.coins
-        if a.mode == "live" and a.cap is None:
-            self.out("Note: live accounts have a wallet cap of 0 until you run set-cap, so they cannot trade yet.")
         try:
             with self.sf() as s:
                 repo = self._repo(s)
@@ -182,7 +187,7 @@ class Admin:
                 p = repo.create(a.user, is_admin=a.admin, **fields)
                 if a.days:
                     repo.set_subscription(p, "active", self.now() + timedelta(days=a.days))
-        except ProfileLimitError as exc:
+        except (ProfileLimitError, LiveCreationError) as exc:
             raise AdminError(str(exc))
         except ValueError as exc:
             raise AdminError(str(exc))
@@ -242,12 +247,14 @@ class Admin:
                 raise AdminError("The key was not stored.")
             self.out("Key check passed: reading and futures enabled, withdrawals disabled.")
         else:
-            self.out("Warning: the key was not verified. Re-run with --verify to confirm withdrawals are disabled.")
+            self.out("Warning: the key was not verified. Re-run with --verify to confirm withdrawals are disabled. Live mode "
+                     "needs a verification no older than 7 days.")
         with self.sf() as s:
             p = self._get(s, a.user)
-            ProfileRepository(s, box).set_credentials(p, key, secret)
+            ProfileRepository(s, box).set_credentials(p, key, secret, verified=bool(a.verify), now=self.now())
         self._audit("set-keys", a.user, "verified" if a.verify else "not verified")
-        self.out(f"Stored encrypted API keys for '{a.user}'.")
+        self.out(f"Stored encrypted API keys for '{a.user}'."
+                 + ("" if a.verify else " They are NOT verified, so this account cannot trade live until you run set-keys --verify."))
 
     def _update(self, user: str, action: str, detail: str, fn) -> None:
         try:
@@ -281,7 +288,9 @@ class Admin:
                 hints = {"no API keys stored": "no API keys stored (run set-keys --verify)",
                          "wallet cap is 0": "wallet cap is 0 (run set-cap)",
                          "real-money confirmation missing": "add --yes-real-money to confirm this account will trade real funds"}
-                problems = [hints[x] for x in live_switch_problems(p, a.yes_real_money)]
+                for msg in (KEYS_MISSING, KEYS_FUTURE, KEYS_STALE, KEYS_UNREADABLE):
+                    hints[msg] = f"{msg} (run set-keys --verify)"
+                problems = [hints.get(x, x) for x in live_switch_problems(p, a.yes_real_money, self.now())]
             if problems:
                 raise AdminError("Cannot switch to live: " + "; ".join(problems) + ".")
             self.out("This account will trade REAL funds. The Binance account must be in One-way position mode, "
@@ -395,9 +404,12 @@ class Admin:
             box = self._need_box()
             adapter = BinanceFuturesAdapter.from_profile(profile, box.decrypt(profile.encrypted_api_key),
                                                          box.decrypt(profile.encrypted_api_secret))
-        else:
+        elif profile.trading_mode == "testnet":
             from g_aegisbot.engine.paper import PaperExchange
             adapter = PaperExchange(self.sf, profile.user_id, None)          # paper ledger: the database is the exchange
+        else:
+            raise AdminError(f"unknown trading mode {profile.trading_mode!r} for '{profile.user_id}'; refusing to choose an "
+                             "exchange adapter.")
         try:
             if getattr(adapter, "exchange", None) is not None and hasattr(adapter.exchange, "load_markets") \
                     and not getattr(adapter, "ledger", False):

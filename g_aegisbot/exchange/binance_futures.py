@@ -137,8 +137,14 @@ class BinanceFuturesAdapter:
 
     @classmethod
     def from_profile(cls, profile, api_key: str, api_secret: str) -> "BinanceFuturesAdapter":
-        """Build an adapter for a UserProfile. Testnet unless the profile is explicitly live."""
-        return cls(api_key, api_secret, testnet=profile.trading_mode != "live")
+        """Build an adapter for a UserProfile. Only 'live' (production) and 'testnet' (sandbox) are accepted; any other
+        value raises instead of falling through to one of them."""
+        mode = profile.trading_mode
+        if mode == "live":
+            return cls(api_key, api_secret, testnet=False)
+        if mode == "testnet":
+            return cls(api_key, api_secret, testnet=True)
+        raise ValueError(f"unknown trading mode {mode!r}: expected 'live' or 'testnet'")
 
     async def __aenter__(self) -> "BinanceFuturesAdapter":
         await self.exchange.load_markets()

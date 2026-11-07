@@ -57,6 +57,9 @@ class UserProfile(Base):
     # Fernet ciphertext only. Plaintext keys are never stored.
     encrypted_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     encrypted_api_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When these exact credentials last passed the Binance permission check (UTC). NULL = never verified. Written in the same
+    # commit as the ciphertext, so replacing the keys without a passing check clears it. A timestamp only: no key material.
+    keys_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     market_type: Mapped[str] = mapped_column(String(16), default="futures")
     trading_mode: Mapped[str] = mapped_column(String(16), default="testnet")

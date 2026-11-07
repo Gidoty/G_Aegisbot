@@ -20,16 +20,15 @@ def test_defaults(session, box):
     assert p.daily_loss_tracker["breaker_tripped"] is False
 
 
-def test_testnet_cap_defaults_to_reference_balance_live_is_blocked(session, box):
+def test_testnet_cap_defaults_to_reference_balance(session, box):
     repo = ProfileRepository(session, box)
     assert repo.create("t").max_wallet_cap_usdt == Decimal("10000")
-    assert repo.create("l", trading_mode="live").max_wallet_cap_usdt == Decimal("0")
 
 
 def test_credentials_encrypted_at_rest(session, box):
     repo = ProfileRepository(session, box)
     p = repo.create("alice")
-    repo.set_credentials(p, "KEY123", "SECRET456")
+    repo.set_credentials(p, "KEY123", "SECRET456", verified=False)
     assert "KEY123" not in p.encrypted_api_key and "SECRET456" not in p.encrypted_api_secret
     assert repo.get_credentials(p) == ("KEY123", "SECRET456")
     assert "KEY123" not in repr(p)

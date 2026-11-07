@@ -5,6 +5,7 @@ import re
 from pydantic import BaseModel, Field, field_validator
 
 from g_aegisbot.config import MAX_ACTIVE_COINS, MAX_LEVERAGE, MIN_LEVERAGE
+from g_aegisbot.db.repository import LIVE_CREATION_MESSAGE
 
 _PAIR = re.compile(r"^[A-Z0-9]{2,20}/USDT:USDT$")
 
@@ -51,6 +52,13 @@ class AdminCreateIn(BaseModel):
     subscription_days: int = Field(default=0, ge=0, le=3650)
 
     _pairs = field_validator("active_coins")(_check_pairs)
+
+    @field_validator("trading_mode")
+    @classmethod
+    def _paper_only(cls, v: str) -> str:
+        if v != "testnet":
+            raise ValueError(LIVE_CREATION_MESSAGE)
+        return v
 
 
 class AdminPatchIn(BaseModel):

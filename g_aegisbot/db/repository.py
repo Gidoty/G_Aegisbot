@@ -1,7 +1,7 @@
 """All reads and writes of tenant data go through here so encryption and limits are enforced once."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -14,6 +14,14 @@ from g_aegisbot.security.crypto import SecretBox
 
 class ProfileLimitError(Exception):
     pass
+
+
+LIVE_CREATION_MESSAGE = ("Accounts cannot be created in live mode. Create a Paper Trading account, store and verify the Binance "
+                         "keys (set-keys --verify), set a wallet cap, then run set-mode <user> live --yes-real-money.")
+
+
+class LiveCreationError(ValueError):
+    """An attempt to create a profile directly in live mode, which would skip the live activation checks."""
 
 
 class ProfileRepository:
@@ -31,6 +39,13 @@ class ProfileRepository:
         return list(self.session.scalars(select(UserProfile).order_by(UserProfile.id)))
 
     def create(self, user_id: str, *, is_admin: bool = False, **fields) -> UserProfile:
+        """New profiles are Paper Trading (testnet) accounts, always. There is no way to ask for a live profile here: the
+        only route to live mode is a paper account followed by set-mode / the admin PATCH, which run live_switch_problems()."""
+        mode = fields.get("trading_mode", "testnet")
+        if mode == "live":
+            raise LiveCreationError(LIVE_CREATION_MESSAGE)
+        if mode not in ("live", "testnet"):
+            raise ValueError("trading_mode must be 'live' or 'testnet'.")
         if self.count() >= MAX_PROFILES:
             raise ProfileLimitError(f"Profile limit reached ({MAX_PROFILES}).")
         # Live profiles start with cap 0 (trading blocked until you set a cap on purpose).
@@ -44,9 +59,14 @@ class ProfileRepository:
         self.session.commit()
         return profile
 
-    def set_credentials(self, profile: UserProfile, api_key: str, api_secret: str) -> None:
+    def set_credentials(self, profile: UserProfile, api_key: str, api_secret: str, *, verified: bool,
+                        now: datetime | None = None) -> None:
+        """Store new credentials. `verified` must say whether THESE credentials just passed the Binance permission check: if
+        so the verification time is recorded, otherwise any earlier verification is cleared. Ciphertext and timestamp are
+        written in one commit, so they cannot disagree."""
         profile.encrypted_api_key = self.box.encrypt(api_key)
         profile.encrypted_api_secret = self.box.encrypt(api_secret)
+        profile.keys_verified_at = (now or datetime.now(timezone.utc)) if verified else None
         self.session.commit()
 
     def get_credentials(self, profile: UserProfile) -> tuple[str, str]:

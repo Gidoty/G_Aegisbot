@@ -24,11 +24,41 @@ def extend_subscription(profile: UserProfile, days: int, now: datetime) -> datet
     return profile.subscription_expires_at
 
 
-def live_switch_problems(profile: UserProfile, confirmed: bool) -> list[str]:
+KEYS_MAX_AGE = timedelta(days=7)
+KEYS_MISSING = "API key verification missing"
+KEYS_FUTURE = "API key verification is dated in the future"
+KEYS_STALE = "API key verification is older than 7 days"
+KEYS_UNREADABLE = "API key verification record is unreadable"
+
+
+def keys_verification_problem(profile: UserProfile, now: datetime | None = None) -> str | None:
+    """Why this profile's API keys do not count as verified right now, or None if they do. Fails closed: a missing,
+    unreadable, future-dated or stale timestamp is a problem. (SQLite returns naive datetimes; they are read as UTC.)"""
+    now = as_utc(now) if now is not None else datetime.now(timezone.utc)
+    try:
+        stamp = getattr(profile, "keys_verified_at", None)
+        if stamp is None:
+            return KEYS_MISSING
+        if not isinstance(stamp, datetime):
+            return KEYS_UNREADABLE
+        stamp = as_utc(stamp)
+        if stamp > now:
+            return KEYS_FUTURE
+        if now - stamp > KEYS_MAX_AGE:
+            return KEYS_STALE
+    except Exception:
+        return KEYS_UNREADABLE
+    return None
+
+
+def live_switch_problems(profile: UserProfile, confirmed: bool, now: datetime | None = None) -> list[str]:
     """What stops this profile from trading real money. Empty means it may go live."""
     problems = []
     if not profile.has_credentials:
         problems.append("no API keys stored")
+    keys = keys_verification_problem(profile, now)
+    if keys:
+        problems.append(keys)
     if float(profile.max_wallet_cap_usdt or 0) <= 0:
         problems.append("wallet cap is 0")
     if not confirmed:

@@ -312,6 +312,27 @@ def test_admin_cannot_exceed_eleven_profiles(env):
     assert r.status_code == 400 and "limit reached" in r.json()["detail"]
 
 
+def test_an_admin_cannot_create_a_live_account_directly_and_nothing_is_stored(env):
+    c, boss = env["client"], hdr(email="boss@example.com", sub="uid-boss")
+    with env["sf"]() as s:
+        before = s.scalar(select(func.count()).select_from(UserProfile))
+    r = c.post("/api/admin/users", headers=boss, json={"user_id": "live1@example.com", "trading_mode": "live",
+                                                       "max_wallet_cap_usdt": 500})
+    assert r.status_code == 422 and "cannot be created in live mode" in r.text
+    r = c.post("/api/admin/users", headers=boss, json={"user_id": "weird@example.com", "trading_mode": "paper"})
+    assert r.status_code == 422
+    with env["sf"]() as s:
+        assert s.scalar(select(func.count()).select_from(UserProfile)) == before
+        assert s.scalar(select(UserProfile).where(UserProfile.user_id.in_(["live1@example.com", "weird@example.com"]))) is None
+
+
+def test_an_admin_creates_a_paper_account_with_the_default_balance_and_cap(env):
+    c, boss = env["client"], hdr(email="boss@example.com", sub="uid-boss")
+    for body in ({"user_id": "p1@example.com"}, {"user_id": "p2@example.com", "trading_mode": "testnet"}):
+        r = c.post("/api/admin/users", headers=boss, json=body)
+        assert r.status_code == 201 and r.json()["trading_mode"] == "testnet" and r.json()["max_wallet_cap_usdt"] == 10000
+
+
 def test_going_live_needs_keys_a_cap_and_explicit_confirmation(env):
     c, boss = env["client"], hdr(email="boss@example.com", sub="uid-boss")
     r = c.patch("/api/admin/users/bob@example.com", headers=boss, json={"trading_mode": "live"})
@@ -925,3 +946,36 @@ def test_no_api_route_can_list_or_resolve_entry_orders(env):
         for path in ("/api/admin/entries", "/api/admin/resolve-entry", "/api/me/entries", "/api/admin/journal"):
             r = env["client"].request(method, path, headers=hdr(email="boss@example.com", sub="uid-boss"))
             assert r.status_code in (404, 405), (method, path, r.status_code)
+
+
+# ------------------------------------------------------------------ key verification record (live-mode safeguard)
+def test_the_key_upload_records_the_verification_time_with_the_ciphertext(env):
+    c = env["client"]
+    assert get_profile(env).keys_verified_at is None
+    assert c.put("/api/me/keys", json={"api_key": KEY, "api_secret": SEC}, headers=hdr()).status_code == 200
+    p = get_profile(env)
+    assert p.has_credentials and p.keys_verified_at.replace(tzinfo=timezone.utc) == NOW
+
+
+def test_a_refused_key_leaves_the_previous_verification_untouched(env):
+    c = env["client"]
+    c.put("/api/me/keys", json={"api_key": KEY, "api_secret": SEC}, headers=hdr())
+    before = get_profile(env)
+    env["state"]["check_result"] = KeyCheck(False, ["WITHDRAWALS ARE ENABLED"])
+    r = c.put("/api/me/keys", json={"api_key": "C" * 24, "api_secret": "D" * 24}, headers=hdr())
+    after = get_profile(env)
+    assert r.status_code == 422 and (after.encrypted_api_key, after.keys_verified_at) == (before.encrypted_api_key, before.keys_verified_at)
+
+
+def test_api_live_activation_needs_current_verification_a_cap_and_confirmation(env):
+    c, boss = env["client"], hdr(email="boss@example.com", sub="uid-boss")
+    bob = hdr(email="bob@example.com", sub="uid-bob")
+    c.put("/api/me/keys", json={"api_key": KEY, "api_secret": SEC}, headers=bob)
+    env["clock"]["now"] = NOW + timedelta(days=8)                                          # verification is now stale
+    r = c.patch("/api/admin/users/bob@example.com", headers=boss, json={"trading_mode": "live", "confirm_real_money": True})
+    assert r.status_code == 400 and "older than 7 days" in r.json()["detail"]
+    env["clock"]["now"] = NOW + timedelta(days=6)
+    r = c.patch("/api/admin/users/bob@example.com", headers=boss, json={"trading_mode": "live"})
+    assert r.status_code == 400 and "confirmation" in r.json()["detail"]                   # confirmation is still required
+    r = c.patch("/api/admin/users/bob@example.com", headers=boss, json={"trading_mode": "live", "confirm_real_money": True})
+    assert r.status_code == 200 and r.json()["trading_mode"] == "live"

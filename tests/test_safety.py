@@ -273,7 +273,7 @@ def go_live(world, monkeypatch, **attrs):
         repo = ProfileRepository(s, world["box"])
         p = s.scalar(select(UserProfile))
         p.trading_mode = "live"
-        repo.set_credentials(p, "KEY", "SECRET")
+        repo.set_credentials(p, "KEY", "SECRET", verified=True, now=world["clock"].now)
         repo.set_wallet_cap(p, Decimal("10000"))
     seen = {}
 

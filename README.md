@@ -197,6 +197,15 @@ stopped.
   generated signatures. Test with the NOWPayments sandbox before taking real payments.
 * Not financial advice. Futures trading can lose more than you expect, quickly.
 
+## Going live: verified keys
+
+An account can only be switched to live mode (and only keeps trading live) while its API keys passed `set-keys --verify` (or the
+dashboard key upload) **no more than 7 days ago**. The check needs Binance to state clearly that withdrawals are off and that
+reading and futures are on; any missing or unclear answer refuses the key. Replacing keys without a passing check clears the
+verification. When it is missing or expired the runner **blocks new live entries** for that account and logs a CRITICAL line, but
+it keeps reconciling, protecting and managing the account's existing positions. If Binance rejects the credentials, the account
+is marked unverified (CRITICAL) and nothing is assumed protected: check its positions on Binance by hand.
+
 ## One runner per database
 
 Run exactly one runner per database. At start the runner takes a lock before it does anything else (SQLite: an exclusive

@@ -34,6 +34,7 @@ from g_aegisbot.engine.protection import ProtectionError, assess_stops
 from g_aegisbot.engine import journal as jr
 from g_aegisbot.engine.journal import PendingEntry
 from g_aegisbot.engine.reconcile import decide, gather_evidence
+from g_aegisbot.services import KEYS_UNREADABLE, keys_verification_problem
 from g_aegisbot.engine.runlock import (
     EXIT_CODE_ALREADY_RUNNING, RunnerAlreadyRunning, RunnerLock, RunnerLockError, RunnerLockLost,
 )
@@ -131,7 +132,7 @@ class TradingRunner:
         for p in profiles:
             if p.trading_mode == "live" and not p.has_credentials:
                 log.warning("[%s] skipped: live mode but no API credentials stored", p.user_id)
-            else:
+            else:                      # key verification gates NEW entries only (_enter); existing positions keep being managed
                 out.append(p)
         return out
 
@@ -145,6 +146,7 @@ class TradingRunner:
 
     async def _adapter_for(self, profile: UserProfile):
         cached = self._adapters.get(profile.user_id)
+
         stamp = (profile.updated_at, profile.trading_mode)
         if cached and cached[0] == stamp:
             return cached[1]
@@ -153,7 +155,7 @@ class TradingRunner:
         if profile.trading_mode == "testnet":
             adapter = PaperExchange(self.sf, profile.user_id, self.market,
                                     starting_balance=float(profile.virtual_balance), clock=self.clock)
-        else:
+        elif profile.trading_mode == "live":
             key = self.box.decrypt(profile.encrypted_api_key)
             secret = self.box.decrypt(profile.encrypted_api_secret)
             adapter = BinanceFuturesAdapter.from_profile(profile, key, secret)
@@ -163,8 +165,42 @@ class TradingRunner:
             except Exception:
                 await adapter.close()
                 raise
+        else:                                         # fail closed: an unexpected mode never becomes paper or live execution
+            raise ValueError(f"[{profile.user_id}] unknown trading mode {profile.trading_mode!r}: expected 'live' or 'testnet'")
         self._adapters[profile.user_id] = (stamp, adapter)
         return adapter
+
+    async def _adapter_or_alert(self, profile: UserProfile):
+        """The adapter for this profile, or None after a loud failure. A live account whose exchange access fails (rejected
+        credentials, network, hedge mode) has positions and stops nobody can confirm, so it is marked UNVERIFIED (CRITICAL
+        log, new entries blocked) and never treated as protected."""
+        uid = profile.user_id
+        try:
+            return await self._adapter_for(profile)
+        except PositionModeError as exc:
+            log.error("[%s] %s", uid, exc)
+            if profile.trading_mode == "live":
+                self._mark_unverified(uid, f"the account's position mode is not one-way, so its positions and stops cannot be "
+                                           f"verified ({exc})")
+        except Exception as exc:
+            log.exception("[%s] could not build exchange adapter", uid)
+            if profile.trading_mode == "live":
+                self._mark_unverified(uid, f"the exchange cannot be reached with this account's credentials "
+                                           f"({type(exc).__name__}); its open positions and protective stops cannot be verified")
+        return None
+
+    def _entry_keys_problem(self, uid: str) -> str | None:
+        """Why a NEW live entry is not allowed for this user right now (API-key verification missing, stale, future-dated
+        or unreadable), judged from a fresh read of the database and the runner's clock. A failed read is a problem."""
+        from sqlalchemy import select
+        try:
+            with self.sf() as s:
+                row = s.scalar(select(UserProfile).where(UserProfile.user_id == uid))
+                if row is None:
+                    return "the profile could not be found"
+                return keys_verification_problem(row, self.clock())
+        except Exception:
+            return KEYS_UNREADABLE
 
     # ------------------------------------------------------------------ circuit breaker
     async def _check_breaker(self, profile: UserProfile, adapter) -> dict:
@@ -224,13 +260,8 @@ class TradingRunner:
         for profile in await asyncio.to_thread(self._load_profiles):
             async with self._locks[profile.user_id]:
                 await self._load_journal(profile.user_id)
-                try:
-                    adapter = await self._adapter_for(profile)
-                except PositionModeError as exc:
-                    log.error("[%s] %s", profile.user_id, exc)
-                    continue
-                except Exception:
-                    log.exception("[%s] could not build exchange adapter", profile.user_id)
+                adapter = await self._adapter_or_alert(profile)
+                if adapter is None:
                     continue
                 if isinstance(adapter, PaperExchange) and not self.dry_run:      # closing paper positions IS a state change
                     try:
@@ -284,7 +315,9 @@ class TradingRunner:
         async with self._locks[profile.user_id]:
             try:
                 await self._load_journal(profile.user_id)
-                adapter = await self._adapter_for(profile)
+                adapter = await self._adapter_or_alert(profile)
+                if adapter is None:
+                    return
                 tracker = await self._check_breaker(profile, adapter)
                 ctrl = await self._apply_controls(profile, adapter)
                 if not ctrl.flatten:
@@ -305,6 +338,10 @@ class TradingRunner:
                     return
                 if tracker["breaker_tripped"]:
                     log.warning(risk.still_paused_message(profile.user_id, tracker, self.clock()))
+                    return
+                if profile.trading_mode == "live" and (why := await asyncio.to_thread(self._entry_keys_problem, profile.user_id)):
+                    log.critical("[%s] NEW LIVE ENTRIES BLOCKED: %s. Existing positions keep being managed. Verify the keys "
+                                 "again (set-keys --verify) to allow new entries.", profile.user_id, why)
                     return
                 for sig in signals:
                     blocked = self._entries_blocked(profile.user_id)
@@ -397,6 +434,10 @@ class TradingRunner:
         """Try to open one position. Returns True when the next signal may be processed, False when processing must
         stop for this cycle because the attempt could have left exposure that is not yet confirmed safe."""
         uid = profile.user_id
+        if profile.trading_mode == "live" and (why := await asyncio.to_thread(self._entry_keys_problem, uid)):
+            # the last check before anything can be sent; it does not depend on the profile row loaded earlier or on any cache
+            log.critical("[%s] live entry %s %s REFUSED: %s", uid, sig.symbol, sig.side, why)
+            return False
         open_trades = await asyncio.to_thread(self.store.list_open, uid)
         plan = await plan_trade(profile, adapter, sig, self.params, trades=open_trades)
         if isinstance(plan, Skip):

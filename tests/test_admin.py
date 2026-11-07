@@ -56,11 +56,6 @@ def test_create_user_defaults_and_listing_hides_secrets(env):
     assert "alice" in out and "none" in out and "1 profile(s)" in out
 
 
-def test_create_live_user_is_blocked_until_a_cap_is_set(env):
-    _, out = do(env, "create-user", "bob", "--mode", "live")
-    assert "wallet cap of 0" in out and float(profile(env, "bob").max_wallet_cap_usdt) == 0
-
-
 def test_duplicate_limit_and_bad_input_give_clear_errors(env):
     do(env, "create-user", "alice")
     code, out = do(env, "create-user", "alice")
@@ -180,7 +175,7 @@ def test_live_mode_needs_keys_a_cap_and_explicit_confirmation(env):
     do(env, "create-user", "alice", "--mode", "testnet")
     code, out = do(env, "set-mode", "alice", "live")
     assert code == 1 and "no API keys" in out and "wallet cap is 0" not in out      # testnet cap defaulted to 10000
-    do(env, "set-keys", "alice")
+    do(env, "set-keys", "alice", "--verify")
     code, out = do(env, "set-mode", "alice", "live")
     assert code == 1 and "--yes-real-money" in out and profile(env, "alice").trading_mode == "testnet"
     code, out = do(env, "set-mode", "alice", "live", "--yes-real-money")

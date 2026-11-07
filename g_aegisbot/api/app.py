@@ -257,7 +257,8 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
 
         def store():
             with sf() as s:
-                ProfileRepository(s, box).set_credentials(get_profile(s, p.user_id), body.api_key, body.api_secret)
+                ProfileRepository(s, box).set_credentials(get_profile(s, p.user_id), body.api_key, body.api_secret,
+                                                         verified=True, now=clock())        # the check above just passed
 
         await run_in_threadpool(store)
         audit.record(sf, p.user_id, "self-set-keys", p.user_id, "verified")
@@ -377,7 +378,7 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
                     prof.active_coins = body.active_coins
                 if body.trading_mode is not None:
                     if body.trading_mode == "live" and prof.trading_mode != "live":
-                        problems = live_switch_problems(prof, body.confirm_real_money)
+                        problems = live_switch_problems(prof, body.confirm_real_money, clock())
                         if problems:
                             raise HTTPException(400, "Cannot switch to live: " + "; ".join(problems) + ".")
                     prof.trading_mode = body.trading_mode

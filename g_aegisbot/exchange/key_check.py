@@ -13,20 +13,41 @@ class KeyCheck:
     warnings: list[str] = field(default_factory=list)
 
 
+def _explicit(value):
+    """True / False only for a real boolean or the strings 'true' / 'false'; None for anything else (never guessed)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    return None
+
+
 def interpret_restrictions(r: dict) -> KeyCheck:
-    """Turn Binance's /sapi/v1/account/apiRestrictions response into pass or fail. Pure function."""
-    flag = lambda k: str(r.get(k)).lower() == "true"
+    """Turn Binance's /sapi/v1/account/apiRestrictions response into pass or fail. Pure function, fails closed: withdrawals
+    must be EXPLICITLY false, reading and futures EXPLICITLY true. A missing, null, malformed or unexpected value for any of
+    them fails the check (it is never read as 'disabled')."""
+    if not isinstance(r, dict):
+        return KeyCheck(ok=False, problems=["Binance's permission answer was not understood, so the key cannot be trusted."])
     problems, warnings = [], []
-    if flag("enableWithdrawals"):
+    withdrawals = _explicit(r.get("enableWithdrawals"))
+    if withdrawals is True:
         problems.append("WITHDRAWALS ARE ENABLED on this key. Create a new key with 'Enable Withdrawals' switched "
                         "off. The bot never needs it, and a leaked key could empty the account.")
-    if not flag("enableReading"):
+    elif withdrawals is None:
+        problems.append("Binance did not state clearly whether withdrawals are enabled, so the key is refused.")
+    reading = _explicit(r.get("enableReading"))
+    if reading is None:
+        problems.append("Binance did not state clearly whether reading is enabled, so the key is refused.")
+    elif not reading:
         problems.append("Reading is not enabled on this key.")
-    if not flag("enableFutures"):
+    futures = _explicit(r.get("enableFutures"))
+    if futures is None:
+        problems.append("Binance did not state clearly whether futures is enabled, so the key is refused.")
+    elif not futures:
         problems.append("'Enable Futures' is not switched on for this key.")
-    if not flag("ipRestrict"):
+    if _explicit(r.get("ipRestrict")) is not True:
         warnings.append("The key is not restricted to trusted IP addresses. Restrict it to the server's IP in Binance.")
-    if flag("enableInternalTransfer") or flag("permitsUniversalTransfer"):
+    if _explicit(r.get("enableInternalTransfer")) is True or _explicit(r.get("permitsUniversalTransfer")) is True:
         warnings.append("The key can make internal or universal transfers. The bot does not need that permission.")
     return KeyCheck(ok=not problems, problems=problems, warnings=warnings)
 

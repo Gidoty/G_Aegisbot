@@ -162,9 +162,10 @@ def build(tmp_path, monkeypatch, symbols=(A,)):
     clock = Clock(closed.index[-1].to_pydatetime() + timedelta(hours=1, seconds=5))
     with sf() as s:
         repo = ProfileRepository(s, box)
-        p = repo.create("alice", active_coins=list(symbols), trading_mode="live")
+        p = repo.create("alice", active_coins=list(symbols))
+        p.trading_mode = "live"                       # fixture only: a paper profile switched directly, as the CLI would after its checks
         repo.set_subscription(p, "active", datetime(2100, 1, 1, tzinfo=timezone.utc))
-        repo.set_credentials(p, "KEY", "SECRET")
+        repo.set_credentials(p, "KEY", "SECRET", verified=True, now=clock.now)
         repo.set_wallet_cap(p, Decimal("10000"))
     holder = {}
 
