@@ -97,6 +97,20 @@ def build_parser() -> argparse.ArgumentParser:
     kill.add_argument("--user", help="limit to one account (default: everyone)")
     kill.add_argument("--flatten", action="store_true", help="also close all positions and cancel their stops")
     kill.add_argument("--reason", default="", help="shown in the logs")
+    bl = sub.add_parser("bind-login", help="attach a Supabase user id to a profile (required for admin profiles)")
+    bl.add_argument("user", help="the profile (user id) to bind")
+    bl.add_argument("supabase_user_id", help="the user's id from Supabase: Authentication > Users > User UID")
+
+    sub.add_parser("pending-entries", help="list entry orders whose outcome is unresolved (they block that user's new trades)")
+    re_ = sub.add_parser("resolve-entry", help="reconcile ONE unresolved entry order against the exchange and, only if the "
+                                               "evidence allows and you confirm, resolve it (audited)")
+    re_.add_argument("user")
+    re_.add_argument("client_order_id", help="the exact client order id shown by pending-entries")
+    re_.add_argument("--symbol", required=True, help="the exact symbol of that order, e.g. BTC/USDT:USDT")
+    re_.add_argument("--reason", help="why you accept the outcome (at least 12 characters, no secrets); required with --confirm")
+    re_.add_argument("--confirm", action="store_true",
+                     help="I have read the evidence above and accept this outcome. Without it nothing is changed")
+
     res = sub.add_parser("resume", help="lift a pause or flatten")
     res.add_argument("--user", help="limit to one account (default: the global switch)")
     return p
@@ -104,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 class Admin:
     def __init__(self, session_factory, box: SecretBox | None, *, out=print, ask_secret=getpass.getpass,
-                 stdin=sys.stdin, verify=None, now=None, actor: str | None = None):
+                 stdin=sys.stdin, verify=None, now=None, actor: str | None = None, adapter_factory=None):
+        self.adapter_factory = adapter_factory       # profile -> exchange adapter used for reconciliation (tests inject)
         self.sf, self.box, self.out, self.ask_secret, self.stdin = session_factory, box, out, ask_secret, stdin
         self.verify, self.now = verify, now or (lambda: datetime.now(timezone.utc))
         self.actor = actor or os.environ.get("USER") or "cli"
@@ -328,6 +343,126 @@ class Admin:
         self._audit("rotate-keys", None, f"{count} profile(s)")
         self.out(f"Re-encrypted {count} profile(s) with the newest key. You may now remove old keys from AEGIS_MASTER_KEYS.")
 
+    def bind_login(self, a) -> None:
+        """Operator-side binding. Needs shell access to the server (it is not reachable from the API), so it is as
+        trusted as create-user. It never overwrites: a bound profile, or an id already bound to another profile, is
+        refused; the id must be a UUID; every bind is audited. It cannot check that the UID exists in Supabase, so
+        copy it from the dashboard."""
+        import uuid
+
+        from g_aegisbot.api.identity import claim_profile
+        try:
+            sub = str(uuid.UUID(a.supabase_user_id.strip()))          # canonical lowercase form, as in the token's `sub`
+        except ValueError:
+            raise AdminError("the Supabase user id must be a UUID: copy the User UID from Supabase > Authentication > Users")
+        with self.sf() as s:
+            p = self._get(s, a.user)
+            pid, bound, name = p.id, p.auth_user_id, p.user_id
+            other = s.scalar(select(UserProfile.user_id).where(UserProfile.auth_user_id == sub))
+        if bound:
+            raise AdminError(f"'{name}' is already bound to a login; refusing to overwrite it.")
+        if other:
+            raise AdminError(f"that Supabase user id is already bound to '{other}'.")
+        if not claim_profile(self.sf, pid, sub):
+            raise AdminError("could not bind (another change got there first); nothing was changed.")
+        self._audit("bind-login", name, f"auth_user_id={sub}")
+        self.out(f"'{name}' is now bound to Supabase user {sub}.")
+        self.out("Note: this tool cannot check that the UID exists in Supabase (that needs a privileged service-role key, "
+                 "which this server deliberately does not hold). Confirm it in Authentication > Users.")
+
+    # ------------------------------------------------------------ unresolved entry orders
+    def pending_entries(self, a) -> None:
+        from g_aegisbot.engine import journal as jr
+        rows = jr.read_unresolved(self.sf)
+        if not rows:
+            self.out("No unresolved entry orders.")
+            return
+        now = self.now()
+        for uid, pe in rows:
+            age = now - pe.submitted_at
+            self.out(f"{uid:<24} {pe.client_id:<38} {pe.symbol:<22} sent {pe.submitted_at:%Y-%m-%d %H:%M:%S}Z "
+                     f"({int(age.total_seconds() // 60)} min ago){'  DAMAGED RECORD' if pe.corrupt else ''}")
+        self.out(f"{len(rows)} unresolved. Each blocks new trades for its user. Reconcile one with "
+                 "'resolve-entry <user> <client order id> --symbol <symbol>'.")
+
+    async def _gather_for(self, profile, symbol: str, client_id: str, submitted_at):
+        """Build the exchange adapter for this profile, collect the evidence, always close the adapter."""
+        from g_aegisbot.engine.reconcile import DEFAULT_MARGIN, gather_evidence
+        if self.adapter_factory is not None:
+            adapter = self.adapter_factory(profile)
+        elif profile.trading_mode == "live":
+            from g_aegisbot.exchange import BinanceFuturesAdapter
+            box = self._need_box()
+            adapter = BinanceFuturesAdapter.from_profile(profile, box.decrypt(profile.encrypted_api_key),
+                                                         box.decrypt(profile.encrypted_api_secret))
+        else:
+            from g_aegisbot.engine.paper import PaperExchange
+            adapter = PaperExchange(self.sf, profile.user_id, None)          # paper ledger: the database is the exchange
+        try:
+            if getattr(adapter, "exchange", None) is not None and hasattr(adapter.exchange, "load_markets") \
+                    and not getattr(adapter, "ledger", False):
+                await adapter.exchange.load_markets()
+            return await gather_evidence(adapter, symbol, client_id, submitted_at, self.now(), DEFAULT_MARGIN)
+        finally:
+            await adapter.close()
+
+    def resolve_entry(self, a) -> None:
+        """Operator resolution of ONE unresolved entry order.
+
+        It always re-reads the exchange and prints what it found. It refuses whenever the evidence is incomplete,
+        contradictory or shows exposure. Even with complete evidence nothing changes without --confirm and a reason, and
+        a reason can never substitute for evidence. A resolution is appended to the audit log with the operator, the
+        time, the reason and a digest of the evidence; the original intent is never touched or removed."""
+        from g_aegisbot.engine import journal as jr
+        from g_aegisbot.engine.reconcile import decide
+        with self.sf() as s:
+            profile = self._get(s, a.user)
+            s.expunge(profile)
+        intent = jr.find_intent(self.sf, profile.user_id, a.client_order_id)
+        if intent is None:
+            raise AdminError(f"'{profile.user_id}' has no entry order with client id '{a.client_order_id}'. "
+                             "Use 'pending-entries' for the exact id.")
+        done = jr.find_resolution(self.sf, intent)
+        if done is not None:
+            raise AdminError(f"that entry order was already resolved by {done.actor} at {done.at:%Y-%m-%d %H:%M:%S}Z; "
+                             "nothing to do.")
+        if intent.detail and intent.detail != a.symbol:
+            raise AdminError(f"symbol mismatch: that order was sent for {intent.detail}, not {a.symbol}.")
+        submitted = intent.at if intent.at.tzinfo else intent.at.replace(tzinfo=timezone.utc)
+        ev = asyncio.run(self._gather_for(profile, a.symbol, a.client_order_id, submitted))
+        dec = decide(ev)
+        self.out("Reconciliation evidence (read from the exchange just now):")
+        for line in ev.lines():
+            self.out("  " + line)
+        self.out(f"Verdict: {dec.outcome.upper()}")
+        for reason in dec.reasons:
+            self.out(f"  - {reason}")
+
+        def refuse(why: str) -> None:
+            self._audit("entry-resolve-refused", a.client_order_id, f"{why}; sha={ev.digest()}"[:400])
+            raise AdminError(f"REFUSED. {why} The block is unchanged.")
+
+        if dec.outcome == "blocked":
+            refuse("The exchange evidence is incomplete, contradictory or shows exposure, so it cannot be cleared.")
+        if dec.outcome == "filled" and ev.position_qty > 0 and not ev.stops_valid:
+            refuse("The order filled and the position is open without a valid full-size protective stop; protect or close "
+                   "the position first (the runner does this on its next check).")
+        if not a.confirm:
+            self.out("Nothing was changed. If you have read the evidence and accept this outcome, run again with "
+                     "--confirm --reason '<why>'.")
+            return
+        reason = (a.reason or "").strip()
+        if len(reason) < 12:
+            raise AdminError("--confirm needs --reason of at least 12 characters. A reason is recorded; it never replaces evidence.")
+        body = f"operator {self.actor}: {dec.outcome}; sha={ev.digest()}; reason: {reason[:90]}; {ev.summary()}"
+        # one atomic conditional INSERT, bound to the original intent row, user and symbol: two operators racing, or a
+        # repeated command, cannot write a second resolution
+        if not jr.resolve_once(self.sf, intent, symbol=a.symbol, actor=self.actor, body=body):
+            raise AdminError("that entry order was resolved by someone else while you were reading the evidence; nothing "
+                             "was written.")
+        self.out(f"Resolved. Recorded as the operator '{self.actor}' with the evidence digest {ev.digest()}. "
+                 "The original entry record is kept; a running bot picks the resolution up on its next check.")
+
     def audit_cmd(self, a) -> None:
         for r in audit.recent(self.sf, a.limit):
             self.out(f"{r.at:%Y-%m-%d %H:%M:%S}  {r.actor:<10} {r.action:<14} {r.target or '-':<14} {r.detail or ''}")
@@ -342,7 +477,8 @@ COMMANDS = {
     "init-db": "init_db", "migrate": "migrate", "gen-key": "gen_key", "create-user": "create_user", "list": "list", "show": "show",
     "set-keys": "set_keys", "set-cap": "set_cap", "set-balance": "set_balance", "set-leverage": "set_leverage",
     "set-coins": "set_coins", "set-mode": "set_mode", "extend": "extend", "expire": "expire", "kill": "kill",
-    "resume": "resume", "status": "status", "rotate-keys": "rotate_keys", "audit": "audit_cmd",
+    "resume": "resume", "status": "status", "rotate-keys": "rotate_keys", "audit": "audit_cmd", "bind-login": "bind_login",
+    "pending-entries": "pending_entries", "resolve-entry": "resolve_entry",
 }
 
 

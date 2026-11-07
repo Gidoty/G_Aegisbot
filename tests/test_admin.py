@@ -290,3 +290,81 @@ async def test_check_api_key_paths():
     assert not bad.ok and "rejected the key" in bad.problems[0]
     with pytest.raises(ccxt.RequestTimeout):                           # a network problem is not a verdict on the key
         await check_api_key("k", "s", exchange=FakeKeyExchange(error=ccxt.RequestTimeout("t")))
+
+
+# ------------------------------------------------------------------ bind-login (operator-side identity binding)
+U1 = "5e1b2f0c-1111-4222-8333-444455556666"
+U2 = "9a8b7c6d-5555-4666-8777-888899990000"
+
+
+def test_bind_login_attaches_the_supabase_id_and_is_audited(env):
+    do(env, "create-user", "root@example.com", "--admin")
+    code, out = do(env, "bind-login", "root@example.com", U1)
+    assert code == 0 and "now bound" in out
+    assert profile(env, "root@example.com").auth_user_id == U1
+    rows = [r for r in audit.recent(env["sf"], 10) if r.action == "bind-login"]
+    assert len(rows) == 1 and rows[0].target == "root@example.com" and rows[0].actor == "tester"
+    assert rows[0].detail == f"auth_user_id={U1}"                      # no key, secret, token or password in the record
+
+
+def test_bind_login_normalises_the_uid_to_the_form_used_in_tokens(env):
+    do(env, "create-user", "root@example.com", "--admin")
+    code, _ = do(env, "bind-login", "root@example.com", f"  {U1.upper()}  ")
+    assert code == 0 and profile(env, "root@example.com").auth_user_id == U1
+
+
+def test_bind_login_never_overwrites_a_bound_profile(env):
+    do(env, "create-user", "root@example.com", "--admin")
+    do(env, "bind-login", "root@example.com", U1)
+    code, out = do(env, "bind-login", "root@example.com", U2)
+    assert code == 1 and "already bound" in out
+    assert profile(env, "root@example.com").auth_user_id == U1
+    assert len([r for r in audit.recent(env["sf"], 10) if r.action == "bind-login"]) == 1      # the refusal is not a bind
+
+
+def test_bind_login_refuses_an_id_that_belongs_to_another_profile(env):
+    do(env, "create-user", "a@example.com")
+    do(env, "create-user", "b@example.com")
+    do(env, "bind-login", "a@example.com", U1)
+    code, out = do(env, "bind-login", "b@example.com", U1)
+    assert code == 1 and "already bound to 'a@example.com'" in out
+    assert profile(env, "b@example.com").auth_user_id is None
+
+
+def test_the_database_itself_refuses_one_uid_on_two_profiles(env):
+    """Even if the CLI check were bypassed, the unique index and the conditional update hold the line."""
+    from g_aegisbot.api.identity import claim_profile
+    do(env, "create-user", "a@example.com")
+    do(env, "create-user", "b@example.com")
+    pa, pb = profile(env, "a@example.com").id, profile(env, "b@example.com").id
+    assert claim_profile(env["sf"], pa, U1) is True
+    assert claim_profile(env["sf"], pb, U1) is False                    # unique index
+    assert claim_profile(env["sf"], pa, U2) is False                    # already bound: the conditional update matches nothing
+    assert profile(env, "a@example.com").auth_user_id == U1 and profile(env, "b@example.com").auth_user_id is None
+
+
+@pytest.mark.parametrize("bad", ["", "has space", "x" * 65, "sb-one", "5e1b2f0c-1111-2222-3333", "not-a-uuid-at-all",
+                                 "5e1b2f0c11114222833344445555666677", "'; DROP TABLE user_profiles; --"])
+def test_bind_login_rejects_anything_that_is_not_a_uuid(env, bad):
+    do(env, "create-user", "a@example.com")
+    code, out = do(env, "bind-login", "a@example.com", bad)
+    assert code == 1 and "UUID" in out and profile(env, "a@example.com").auth_user_id is None
+
+
+def test_bind_login_unknown_profile(env):
+    code, out = do(env, "bind-login", "ghost@example.com", U1)
+    assert code == 1 and "No profile named" in out
+
+
+def test_bind_login_output_and_audit_contain_no_secrets(env):
+    do(env, "create-user", "root@example.com", "--admin")
+    do(env, "set-keys", "root@example.com")                              # stores a (fake) API key and secret
+    code, out = do(env, "bind-login", "root@example.com", U1)
+    everything = out + " ".join(f"{r.actor} {r.action} {r.target} {r.detail}" for r in audit.recent(env["sf"], 20))
+    assert code == 0 and "KEY123456" not in everything and "SECRET987654" not in everything
+
+
+def test_bind_login_tells_the_operator_it_cannot_verify_that_the_uid_exists(env):
+    do(env, "create-user", "root@example.com", "--admin")
+    code, out = do(env, "bind-login", "root@example.com", U1)
+    assert code == 0 and "cannot check that the UID exists in Supabase" in out and "service-role" in out

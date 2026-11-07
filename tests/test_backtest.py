@@ -8,6 +8,7 @@ from g_aegisbot.backtest.data import synthetic_ohlcv
 from g_aegisbot.backtest.metrics import compute_metrics, max_drawdown, sharpe_ratio
 from g_aegisbot.backtest.simulator import Backtester, BacktestConfig
 from g_aegisbot.costs import FUNDING_RATE_8H, TAKER_FEE, slippage_rate
+from g_aegisbot.engine.strategy import StrategyParams
 from tests.test_strategy import make, with_breakout
 
 SYM = "BTC/USDT:USDT"
@@ -64,7 +65,7 @@ def test_stop_out_costs_match_the_model_and_books_balance():
     res = run({SYM: frame})
     assert len(res.trades) == 1
     t = res.trades[0]
-    assert t["side"] == "buy" and t["reason"] == "stop-loss"
+    assert t["side"] == "buy" and t["reason"] == "trailing-stop"          # the stop had ratcheted up during the 3 quiet bars
     entry_open = frame["open"].iloc[BASE]
     assert t["entry_price"] == pytest.approx(entry_open * (1 + slippage_rate(SYM)))
     assert t["exit_price"] < t["entry_price"]
@@ -89,21 +90,27 @@ def test_trailing_stop_locks_in_profit():
     rise = [(121 + j, 122 + j, 120.8 + j, 121.5 + j) for j in range(12)]
     frame = breakout_frame(rise + [(133, 133, 100, 110)])
     t = run({SYM: frame}).trades[0]
-    assert t["reason"] == "stop-loss" and t["exit_price"] > t["entry_price"] and t["pnl"] > 0
+    assert t["reason"] == "trailing-stop" and t["exit_price"] > t["entry_price"] and t["pnl"] > 0
 
 
 def test_open_position_is_closed_at_end_of_data():
     frame = breakout_frame([(121, 121.3, 120.8, 121.0)] * 2)
     res = run({SYM: frame})
-    assert [x["reason"] for x in res.trades] == ["end of data"]
+    assert [x["reason"] for x in res.trades] == ["end-of-data"]
     assert res.metrics["end_equity"] == pytest.approx(10_000 + res.trades[0]["pnl"])
 
 
 def test_max_four_positions_in_backtest():
     frame = breakout_frame([(121, 121.3, 120.8, 121.0)] * 3)
     frames = {f"C{i}/USDT:USDT": frame for i in range(7)}
-    res = run(frames)
+    res = run(frames, params=StrategyParams(max_same_direction=0))          # the 4-position cap, with the side cap off
     assert len(res.trades) == 4
+
+
+def test_at_most_three_positions_per_side_by_default_in_backtest():
+    frame = breakout_frame([(121, 121.3, 120.8, 121.0)] * 3)
+    res = run({f"C{i}/USDT:USDT": frame for i in range(7)})
+    assert len(res.trades) == 3 and all(t["side"] == "buy" for t in res.trades)
 
 
 def test_short_side_and_costs_symmetric():
@@ -149,8 +156,9 @@ def test_cli_synthetic_end_to_end(tmp_path, capsys):
     main(["--synthetic", "--years", "0.5", "--symbols", "A/USDT:USDT", "B/USDT:USDT", "--out", str(tmp_path)])
     out = capsys.readouterr().out
     assert "SYNTHETIC" in out and "Win rate" in out and "Profit factor" in out and "Max drawdown" in out
-    run_dir = next(tmp_path.iterdir())
+    run_dir = next(tmp_path.rglob("summary.json")).parent                  # <run>/<label>/<strategies>/
     assert {"summary.json", "trades.csv", "equity.csv"} <= {p.name for p in run_dir.iterdir()}
+    assert run_dir.name == "breakout+trend"                                # both strategies run by default in the CLI
 
 
 # ---- warm-up enforcement and exclusion from statistics
@@ -261,7 +269,7 @@ def test_cli_report_states_assumptions_and_excludes_warmup(tmp_path, capsys):
     assert "not an exact exchange simulation" in out and "NOT an exact Binance liquidation simulation" in out
     assert "Historical Binance funding rates are NOT used" in out
     assert "measured period only; warm-up excluded" in out and "500 closed candles required" in out
-    summary = json.loads(next(tmp_path.iterdir()).joinpath("summary.json").read_text())
+    summary = json.loads(next(tmp_path.rglob("summary.json")).read_text())
     assert "NOT an exact Binance liquidation simulation" in summary["notes"]["assumptions"]["liquidation"]
     assert summary["notes"]["warmup"]["required_candles"] == 500
 

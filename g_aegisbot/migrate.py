@@ -47,18 +47,31 @@ def upgrade(engine: Engine) -> str:
     adopted (stamped at the baseline) first. Returns the resulting revision."""
     with engine.begin() as conn:
         cfg = _config(engine, conn)
-        names = set(inspect(conn).get_table_names())
+        insp = inspect(conn)
+        names = set(insp.get_table_names())
         if "alembic_version" not in names and "user_profiles" in names:
-            command.stamp(cfg, "0001")
+            # Built by create_all before migrations were tracked. Stamp the revision whose schema it actually has:
+            # a database made from the current models already carries 0002's columns.
+            columns = {c["name"] for c in insp.get_columns("user_profiles")}
+            command.stamp(cfg, "0002" if "auth_user_id" in columns else "0001")
         command.upgrade(cfg, "head")
     return current_revision(engine) or ""
+
+
+def _stamp_head(engine: Engine) -> None:
+    with engine.begin() as conn:
+        command.stamp(_config(engine, conn), "head")
 
 
 def ensure_schema(engine: Engine) -> None:
     """Called by every entrypoint. SQLite: create tables. Anything else: demand an up-to-date schema."""
     if engine.dialect.name == "sqlite":
-        from g_aegisbot.db import init_db
-        init_db(engine)
+        if inspect(engine).get_table_names():
+            upgrade(engine)                       # an existing local database is migrated, never assumed current
+        else:
+            from g_aegisbot.db import init_db
+            init_db(engine)
+            _stamp_head(engine)                   # so later migrations apply to it
         return
     cur, head = current_revision(engine), head_revision(engine)
     if cur != head:

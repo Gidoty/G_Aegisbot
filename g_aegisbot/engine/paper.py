@@ -30,6 +30,8 @@ def _next_minute(dt: datetime) -> datetime:
 
 
 class PaperExchange:
+    ledger = True        # positions live in our own database: there is no separate exchange to disagree with it
+
     def __init__(self, session_factory, user_id: str, market, *, starting_balance: float | None = None,
                  taker_fee: float = TAKER_FEE, slippage_scale: float = 1.0, clock=_utcnow):
         self.sf, self.user_id, self.market = session_factory, user_id, market
@@ -94,7 +96,9 @@ class PaperExchange:
         self._seq += 1
         return f"paper-{kind}-{int(self.clock().timestamp() * 1000)}-{self._seq}"
 
-    async def market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
+    async def market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False,
+                           client_id: str | None = None, strategy: str | None = None,
+                           reason: str | None = None) -> dict:
         price = await self.fetch_last_price(symbol)
         with self.sf() as s:
             pos = s.scalar(select(PaperPosition).where(
@@ -102,7 +106,7 @@ class PaperExchange:
             if reduce_only:
                 if pos is None or pos.side == side:
                     raise ccxt.InvalidOrder("reduce-only order would not reduce a position")
-                return self._close(s, pos, price, min(amount, pos.amount), "market close", is_stop=False)
+                return self._close(s, pos, price, min(amount, pos.amount), reason or "market close", is_stop=False)
             if pos is not None:
                 raise ccxt.InvalidOrder(f"{symbol}: position already open")
             lev = self._leverage.get(symbol, DEFAULT_LEVERAGE)
@@ -117,7 +121,7 @@ class PaperExchange:
             now = self.clock()
             s.add(PaperPosition(user_id=self.user_id, symbol=symbol, side=side, amount=amount, entry_price=fill,
                                 leverage=lev, margin=margin, entry_fee=fee, opened_at=now,
-                                next_check_ts=_next_minute(now)))
+                                next_check_ts=_next_minute(now), strategy=strategy or "breakout"))
             wallet.wallet_balance -= fee
             s.commit()
             return {"id": self._order_id("m"), "average": fill, "filled": amount, "fee": fee, "status": "closed"}
@@ -141,7 +145,12 @@ class PaperExchange:
                 PaperPosition.user_id == self.user_id, PaperPosition.symbol == symbol))
         if pos is None or pos.stop_price is None:
             return []
-        return [{"id": pos.stop_order_id, "stopPrice": pos.stop_price, "side": "sell" if pos.side == "buy" else "buy"}]
+        return [{"id": pos.stop_order_id, "stopPrice": pos.stop_price, "side": "sell" if pos.side == "buy" else "buy",
+                 "amount": pos.amount, "reduceOnly": True, "closePosition": False, "type": "stop_market",
+                 "workingType": "MARK_PRICE"}]
+
+    async def fetch_open_orders(self, symbol: str) -> list[dict]:
+        return []                      # paper entries fill at once; the only resting order is the stop, listed above
 
     async def assert_one_way_mode(self) -> None:
         return None
@@ -176,7 +185,8 @@ class PaperExchange:
         wallet.wallet_balance += gross - fee                 # entry fee was paid at open
         s.add(TradeLog(user_id=self.user_id, symbol=pos.symbol, side=pos.side, amount=amount,
                        entry_price=pos.entry_price, exit_price=fill, pnl=net, fees=fee + entry_fee_share,
-                       opened_at=_aware(pos.opened_at), closed_at=self.clock(), exit_reason=reason, mode="testnet"))
+                       opened_at=_aware(pos.opened_at), closed_at=self.clock(), exit_reason=reason, mode="testnet",
+                       strategy=pos.strategy))
         if frac >= 0.999999:
             s.delete(pos)
         else:

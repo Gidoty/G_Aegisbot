@@ -17,12 +17,14 @@ class TradeStore:
             return list(s.scalars(select(OpenTrade).where(OpenTrade.user_id == user_id)))
 
     def open(self, *, user_id: str, symbol: str, side: str, entry_price: float, stop_price: float,
-             stop_order_id: str | None, leverage: int, mode: str, opened_at: datetime) -> None:
+             stop_order_id: str | None, leverage: int, mode: str, opened_at: datetime,
+             strategy: str = "breakout", trail_atr_mult: float | None = None) -> None:
         with self.sf() as s:
             s.execute(delete(OpenTrade).where(OpenTrade.user_id == user_id, OpenTrade.symbol == symbol))
             s.add(OpenTrade(user_id=user_id, symbol=symbol, side=side, entry_price=entry_price,
                             stop_price=stop_price, extreme_price=entry_price, stop_order_id=stop_order_id,
-                            leverage=leverage, mode=mode, opened_at=opened_at))
+                            leverage=leverage, mode=mode, opened_at=opened_at, strategy=strategy,
+                            trail_atr_mult=trail_atr_mult))
             s.commit()
 
     def update_trail(self, trade_id: int, *, stop_price: float, extreme_price: float,

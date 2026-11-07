@@ -26,61 +26,47 @@ class BillingError(Exception):
 
 
 # ---------------------------------------------------------------- signature
-def js_number(x: float) -> str:
-    """Render a number exactly as JavaScript's JSON.stringify would (10.0 -> '10', 1e-7 -> '1e-7')."""
-    if x == 0:
-        return "0"
-    sign, digits, exp = Decimal(repr(abs(x))).as_tuple()
-    all_digits = "".join(map(str, digits))
-    stripped = all_digits.lstrip("0")
-    point = len(all_digits) + exp - (len(all_digits) - len(stripped))      # decimal point position (JS 'n')
-    s = stripped.rstrip("0") or "0"
-    k = len(s)
-    neg = "-" if x < 0 else ""
-    if k <= point <= 21:
-        out = s + "0" * (point - k)
-    elif 0 < point <= 21:
-        out = s[:point] + "." + s[point:]
-    elif -6 < point <= 0:
-        out = "0." + "0" * (-point) + s
-    else:
-        e = point - 1
-        out = s[0] + ("." + s[1:] if k > 1 else "") + "e" + ("+" if e >= 0 else "-") + str(abs(e))
-    return neg + out
+class _Num(str):
+    """A JSON number kept as the exact text the sender wrote, so '10.0' is never silently rewritten to '10'."""
 
 
-def _js_canonical(obj) -> str:
+def _parse_raw(body: str | bytes):
+    return json.loads(body, parse_float=_Num, parse_int=_Num, parse_constant=_reject_constant)
+
+
+def _reject_constant(name):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def canonical(obj) -> str:
+    """THE canonical form that is signed: object keys sorted at every level, no whitespace (separators ',' and ':'),
+    non-ASCII characters unescaped, numbers exactly as received. This is the only form accepted; there are no fallbacks."""
     if isinstance(obj, dict):
-        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _js_canonical(obj[k]) for k in sorted(obj)) + "}"
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + canonical(obj[k]) for k in sorted(obj)) + "}"
     if isinstance(obj, list):
-        return "[" + ",".join(_js_canonical(v) for v in obj) + "]"
+        return "[" + ",".join(canonical(v) for v in obj) + "]"
+    if isinstance(obj, _Num):
+        return str(obj)
     if isinstance(obj, bool) or obj is None or isinstance(obj, str):
         return json.dumps(obj, ensure_ascii=False)
-    if isinstance(obj, int):
-        return str(obj)
-    return js_number(float(obj))
+    return json.dumps(obj)                                    # Python numbers handed in directly (tests, tools)
 
 
-def canonical_candidates(payload: dict) -> list[str]:
-    """The ways the sender may have serialised the sorted body. Any match proves the HMAC, so trying
-    several costs nothing in security: the shared secret is still required to produce a match."""
-    return [
-        json.dumps(payload, separators=(",", ":"), sort_keys=True),                      # NOWPayments' Python example
-        json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False),
-        _js_canonical(payload),                                                           # JSON.stringify semantics
-    ]
+def sign(body: "str | bytes | dict", secret: str) -> str:
+    """HMAC-SHA512 (hex) of the canonical form of a request body. Strings and bytes keep their number literals."""
+    obj = body if isinstance(body, dict) else _parse_raw(body)
+    return hmac.new(secret.encode(), canonical(obj).encode(), hashlib.sha512).hexdigest()
 
 
-def sign(payload: dict, secret: str, variant: int = 0) -> str:
-    return hmac.new(secret.encode(), canonical_candidates(payload)[variant].encode(), hashlib.sha512).hexdigest()
-
-
-def verify_signature(payload: dict, signature: str | None, secret: str) -> bool:
+def verify_signature(body: "str | bytes | dict", signature: str | None, secret: str) -> bool:
+    """Constant-time check of the x-nowpayments-sig header against the canonical form of the RAW request body."""
     if not signature or not secret:
         return False
-    sig = signature.strip().lower()
-    return any(hmac.compare_digest(hmac.new(secret.encode(), c.encode(), hashlib.sha512).hexdigest(), sig)
-               for c in canonical_candidates(payload))
+    try:
+        expected = sign(body, secret)
+    except ValueError:
+        return False
+    return hmac.compare_digest(expected, signature.strip().lower())
 
 
 # ---------------------------------------------------------------- client

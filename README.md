@@ -44,6 +44,12 @@ and trails, moving only in the trade's favour. The stop lives on the exchange, s
 
 These numbers are starting points. Nothing here has been optimised or validated on real data.
 
+A second, independent strategy (trend-following pullback) is available but off by default. Set
+`AEGIS_STRATEGIES=breakout,trend` to run both; the portfolio limits above and the new aggregate-risk (4%), same-side (3)
+and gross-notional (2x) limits apply to the combined book. Details: `docs/STRATEGIES.md`, `docs/RISK_CONTROLS.md`.
+How to run the historical tests on the VPS: `docs/BACKTEST_PROGRAMME.md`. Before any testnet order:
+`docs/TESTNET_CHECKLIST.md`.
+
 ## Setup (development)
 
 ```bash
@@ -105,6 +111,23 @@ use the app only if a profile exists whose `user_id` is that login's email.
    under Authentication > URL configuration.
 4. On the server set `AEGIS_CORS_ORIGINS` to the dashboard URL and `SUPABASE_URL` (or `SUPABASE_JWT_SECRET`).
 5. Create a profile whose user id is each person's login email: `python -m g_aegisbot.admin create-user them@example.com --days 30`.
+   **How a login gets linked to its profile.** A profile is tied to the person's immutable Supabase user id, never to
+   an email after the first time. On a first sign-in the API asks Supabase Auth itself (server side, with the person's
+   token) whether that user id owns that email and has *confirmed* it, and only then links the profile, atomically and
+   once. Nothing in the token counts as proof (its `user_metadata` can be edited by the user). This needs `SUPABASE_URL`
+   and `SUPABASE_ANON_KEY` (the project's *public* anon key, the same one the dashboard uses; never the service-role key)
+   on the API server. If either is missing, or Supabase cannot be reached, nobody is linked automatically.
+   **Automatic linking is only as trustworthy as your Supabase setting "Confirm email".** Keep it **enabled**. When it is
+   disabled, Supabase auto-confirms every address: `email_confirmed_at` is then stamped at sign-up although nobody proved
+   they received an email, so that field alone cannot prove ownership, and anyone could sign up with an invited person's
+   address first. In that case do not enable automatic linking (leave `SUPABASE_ANON_KEY` unset) and link everyone with
+   `bind-login`.
+   **Admin profiles are never linked on first sign-in**, and neither is anyone when automatic linking is off. After the
+   person has a Supabase login, copy their *User UID* (a UUID) from Authentication > Users and run
+   `python -m g_aegisbot.admin bind-login you@example.com <User UID>` on the server. It refuses to overwrite, refuses a
+   UID already used by another profile, requires a UUID, and is audited. It is not reachable from the API. It cannot
+   check that the UID exists in Supabase, because that needs a privileged service-role key which this server
+   deliberately does not hold; confirm the UID in the Supabase dashboard yourself.
 
 Pages: Overview (equity, daily loss limit, positions, pause), Trades, Settings (leverage, pairs, API key),
 Billing, and Admin (kill switch, users, audit, payments). Local development:
@@ -168,12 +191,38 @@ stopped.
   funding rate, a simplified liquidation model). The backtest is not an exact Binance simulation.
 * The 4% limit stops new entries; it does not close open positions.
 * A deposit or withdrawal during the day shifts equity and can trip or mask the daily limit.
-* Binance changes its API: re-run the self-test after any ccxt upgrade.
+* Binance changes its API: ccxt is pinned to the audited `4.5.92` in `requirements.txt`. Do not upgrade it without repeating the
+  adapter tests (`tests/test_adapter_real_ccxt.py`) and the testnet self-test.
 * Billing signatures follow NOWPayments' documented method but have only been tested against locally
   generated signatures. Test with the NOWPayments sandbox before taking real payments.
 * Not financial advice. Futures trading can lose more than you expect, quickly.
 
+## One runner per database
+
+Run exactly one runner per database. At start the runner takes a lock before it does anything else (SQLite: an exclusive
+`flock` on `<database file>.runner.lock`; PostgreSQL: a session advisory lock on a dedicated connection, which needs the direct or
+session-pooler address, not the transaction pooler on port 6543). A second runner exits with code 3 and touches nothing. The
+kernel or server drops the lock when the process ends for any reason, so a crash leaves no stale lock.
+
+* systemd: keep one `aegisbot-runner.service`; do not enable a second unit that points at the same database.
+* Docker Compose: run one `runner` service (no `--scale`), and mount the same data directory if you also run the CLI in a
+  container, so both see the same lock file. A container with its own copy of the database file is a different database.
+
+`--dry-run` is read-only on the exchange: it reads and reports, and it places no orders, cancels nothing, moves no stops and
+writes no journal resolutions.
+
 ## Environment reference
 
-See `.env.example`. Key variables: `AEGIS_MASTER_KEYS`, `AEGIS_DATABASE_URL`, `SUPABASE_URL` or
-`SUPABASE_JWT_SECRET`, `AEGIS_CORS_ORIGINS`, and the optional `NOWPAYMENTS_*` / `SUBSCRIPTION_*` group.
+Key variables: `AEGIS_MASTER_KEYS`, `AEGIS_DATABASE_URL`, `SUPABASE_URL` or `SUPABASE_JWT_SECRET`, `SUPABASE_ANON_KEY`,
+`AEGIS_CORS_ORIGINS`, `AEGIS_STRATEGIES`, and the optional `NOWPAYMENTS_*` / `SUBSCRIPTION_*` group. Add these two lines to
+your `.env` (and to `.env.example` as placeholders) to enable automatic first-login linking; never put a real key in the
+example file:
+
+```
+SUPABASE_URL=https://YOUR-PROJECT-REF.supabase.co
+SUPABASE_ANON_KEY=YOUR-PUBLIC-ANON-KEY
+```
+
+The anon key is the project's public key. Never use the service-role key here.
+
+Unresolved entry orders and how an operator clears them: `docs/OPERATOR_RECOVERY.md`.

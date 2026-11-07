@@ -48,7 +48,10 @@ class UserProfile(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)   # internal profile handle, never changes
+    # Supabase `sub` (immutable user id). Bound on first successful login. Identity checks use THIS, not the email.
+    auth_user_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
+    login_email: Mapped[str | None] = mapped_column(String(254), index=True, nullable=True)   # invite and display only
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Fernet ciphertext only. Plaintext keys are never stored.

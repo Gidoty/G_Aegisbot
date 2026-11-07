@@ -6,7 +6,7 @@ import { EquityChart } from "@/components/EquityChart";
 import { useMe } from "@/components/Shell";
 import { Badge, Banner, Button, Card, Empty, ErrorBox, Loading, SideBadge, Stat, TableWrap, Td, Th } from "@/components/ui";
 import { api, errorText } from "@/lib/api";
-import { ago, dateTime, daysLeft, pct, price, shortSymbol, signedUsd, tone, usd } from "@/lib/format";
+import { ago, dateTime, daysLeft, pct, price, shortSymbol, signedUsd, strategyLabel, tone, usd } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import type { EquityPoint, Health, Position } from "@/lib/types";
 
@@ -138,6 +138,7 @@ export default function OverviewPage() {
               <tr>
                 <Th>Pair</Th>
                 <Th>Side</Th>
+                <Th>Strategy</Th>
                 <Th right>Entry</Th>
                 <Th right>Stop</Th>
                 <Th right>Best</Th>
@@ -152,6 +153,7 @@ export default function OverviewPage() {
                   <tr key={p.symbol}>
                     <Td>{shortSymbol(p.symbol)}</Td>
                     <Td><SideBadge side={p.side} /></Td>
+                    <Td className="text-mute">{strategyLabel(p.strategy)}</Td>
                     <Td right>{price(p.entry_price)}</Td>
                     <Td right>{price(p.stop_price)}</Td>
                     <Td right>{price(p.best_price)}</Td>

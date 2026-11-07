@@ -1,7 +1,7 @@
 "use client";
 
 import { Badge, Card, Empty, ErrorBox, Loading, SideBadge, Stat, TableWrap, Td, Th } from "@/components/ui";
-import { dateTime, price, shortSymbol, signedUsd, tone, usd } from "@/lib/format";
+import { dateTime, price, shortSymbol, signedUsd, strategyLabel, tone, usd } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import type { Trade } from "@/lib/types";
 
@@ -32,6 +32,7 @@ export default function TradesPage() {
                 <Th>Closed</Th>
                 <Th>Pair</Th>
                 <Th>Side</Th>
+                <Th>Strategy</Th>
                 <Th right>Entry</Th>
                 <Th right>Exit</Th>
                 <Th right>Result</Th>
@@ -46,6 +47,7 @@ export default function TradesPage() {
                   <Td className="text-mute">{dateTime(t.closed_at)}</Td>
                   <Td>{shortSymbol(t.symbol)}</Td>
                   <Td><SideBadge side={t.side} /></Td>
+                  <Td className="text-mute">{strategyLabel(t.strategy)}</Td>
                   <Td right>{price(t.entry_price)}</Td>
                   <Td right>{price(t.exit_price)}</Td>
                   <Td right tone={tone(t.pnl)}>{t.pnl === null ? "see exchange" : signedUsd(t.pnl)}</Td>

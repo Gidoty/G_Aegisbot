@@ -50,3 +50,10 @@ export function dateTime(iso: string | null | undefined): string {
   const d = new Date(iso);
   return `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 16)} UTC`;
 }
+
+/** Human label for the strategy that opened a position. Unknown or missing values are shown as they are, never guessed. */
+export function strategyLabel(s: string | null | undefined): string {
+  if (!s) return "unknown";
+  const names: Record<string, string> = { breakout: "Breakout", trend: "Trend", adopted: "Adopted" };
+  return names[s] ?? s;
+}

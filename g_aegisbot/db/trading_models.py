@@ -28,6 +28,8 @@ class OpenTrade(Base):
     stop_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     leverage: Mapped[int] = mapped_column(Integer)
     mode: Mapped[str] = mapped_column(String(8))                 # live | testnet
+    strategy: Mapped[str] = mapped_column(String(24), default="breakout", server_default="breakout")
+    trail_atr_mult: Mapped[float | None] = mapped_column(Float, nullable=True)   # None: the default multiple
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     last_trail_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -48,6 +50,7 @@ class TradeLog(Base):
     closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     exit_reason: Mapped[str] = mapped_column(String(64))
     mode: Mapped[str] = mapped_column(String(8))
+    strategy: Mapped[str] = mapped_column(String(24), default="breakout", server_default="breakout")
 
 
 class PaperAccount(Base):
@@ -73,6 +76,7 @@ class PaperPosition(Base):
     entry_fee: Mapped[float] = mapped_column(Float)
     stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     stop_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy: Mapped[str] = mapped_column(String(24), default="breakout", server_default="breakout")
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     next_check_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))   # first 1m candle still to scan for stop hits
 

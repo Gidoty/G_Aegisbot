@@ -138,16 +138,26 @@ class FakeAdapter:
         self.positions = list(positions)
         self.exchange = FakeEx()
         self.calls = []
+        self.opened = []
         self.fail_stop = False
 
     async def fetch_usdt_balance(self): return self.bal
-    async def fetch_open_positions(self, symbols=None): return self.positions
+    async def fetch_open_positions(self, symbols=None): return self.positions + self.opened
     async def configure_symbol(self, s, lev): self.calls.append(("configure", s, lev))
-    async def market_order(self, s, side, amt, reduce_only=False):
-        self.calls.append(("market", side, amt, reduce_only)); return {"id": "m"}
+    async def market_order(self, s, side, amt, reduce_only=False, **kw):
+        self.calls.append(("market", side, amt, reduce_only))
+        if reduce_only:
+            self.opened = []                                  # the exchange now shows no position
+        else:                                                 # a realistic reply: filled, and the position exists
+            self.opened = [{"symbol": s, "side": "long" if side == "buy" else "short", "contracts": amt, "entryPrice": 1.0}]
+        return {"id": "m", "status": "closed", "filled": amt}
     async def stop_market(self, s, side, amt, price):
         if self.fail_stop: raise RuntimeError("boom")
-        self.calls.append(("stop", side, amt, price)); return {"id": "s"}
+        self.calls.append(("stop", side, amt, price))
+        self.stops = [{"id": "s", "symbol": s, "side": side, "type": "stop_market", "reduceOnly": True, "closePosition": False,
+                       "positionSide": "BOTH", "workingType": "MARK_PRICE", "stopPrice": price, "amount": amt, "status": "open"}]
+        return {"id": "s"}
+    async def fetch_stop_orders(self, s): return list(getattr(self, "stops", []))
 
 
 def profile(cap=Decimal("5000"), active=True, tripped=False, leverage=3):
@@ -293,8 +303,60 @@ async def test_small_risk_trade_is_not_trimmed():
     assert not plan.risk_capped
 
 
+def held(n, side="long", entry=50_000.0):
+    return [{"symbol": f"C{i}/USDT:USDT", "side": side, "contracts": 0.001, "entryPrice": entry} for i in range(n)]
+
+
 async def test_max_four_concurrent_positions():
-    others = [{"symbol": f"C{i}/USDT:USDT", "contracts": 1} for i in range(3)]
-    assert isinstance(await plan_trade(profile(), FakeAdapter(positions=others), signal(), P), TradePlan)   # 4th is allowed
-    r = await plan_trade(profile(), FakeAdapter(positions=others + [{"symbol": "X/USDT:USDT", "contracts": 1}]), signal(), P)
+    mixed = held(2, "long") + held(1, "short")
+    mixed[2]["symbol"] = "C9/USDT:USDT"
+    assert isinstance(await plan_trade(profile(), FakeAdapter(positions=mixed), signal(), P), TradePlan)   # 4th is allowed
+    four = mixed + [{"symbol": "X/USDT:USDT", "side": "short", "contracts": 0.001, "entryPrice": 50_000.0}]
+    r = await plan_trade(profile(), FakeAdapter(positions=four), signal(), P)
     assert isinstance(r, Skip) and "max 4 open positions" in r.reason
+
+
+async def test_a_fourth_position_on_the_same_side_is_blocked_as_correlated():
+    r = await plan_trade(profile(), FakeAdapter(positions=held(3, "long")), signal(), P)       # signal() is a long
+    assert isinstance(r, Skip) and "3 positions already open on the long side" in r.reason
+    assert isinstance(await plan_trade(profile(), FakeAdapter(positions=held(3, "short")), signal(), P), TradePlan)
+
+
+async def test_same_side_cap_can_be_switched_off_for_comparison():
+    r = await plan_trade(profile(), FakeAdapter(positions=held(3, "long")), signal(), replace(P, max_same_direction=0))
+    assert isinstance(r, TradePlan)
+
+
+async def test_aggregate_open_risk_cap_trims_then_blocks_new_trades():
+    from g_aegisbot.engine.strategy import portfolio_state
+    sig = signal(0.135)                                                  # entry 50k, stop 3% away
+    # two open longs whose stops are 2% below entry, each 0.4 BTC: risk = 2 x 0.4 x 1000 = 800 of 5000 allocated (16%)
+    pos = [{"symbol": f"C{i}/USDT:USDT", "side": "short" if i else "long", "contracts": 0.4, "entryPrice": 50_000.0} for i in range(2)]
+    trades = [type("T", (), {"symbol": p_["symbol"], "stop_price": 49_000.0 if p_["side"] == "long" else 51_000.0})() for p_ in pos]
+    st = portfolio_state(pos, trades)
+    assert st.open_risk == pytest.approx(800.0)
+    r = await plan_trade(profile(), FakeAdapter(positions=pos), sig, P, trades=trades)
+    assert isinstance(r, Skip) and "aggregate open risk" in r.reason     # 800 already exceeds the 4% of 5000 = 200 budget
+    # with one small open position there is room, but the new trade is trimmed to the remaining budget
+    small = [{"symbol": "C0/USDT:USDT", "side": "short", "contracts": 0.16, "entryPrice": 50_000.0}]
+    small_t = [type("T", (), {"symbol": "C0/USDT:USDT", "stop_price": 51_000.0})()]            # risk 160 of the 200 budget
+    r = await plan_trade(profile(), FakeAdapter(positions=small), sig, P, trades=small_t)
+    assert isinstance(r, TradePlan) and r.risk_note == "aggregate open-risk limit"
+    assert r.risk_usdt + 160.0 <= 5000 * 0.04 + 1e-6 and 0 < r.risk_usdt < 60       # trimmed from ~60 to the 40 that remains
+
+
+async def test_a_position_with_no_known_stop_counts_at_a_conservative_loss():
+    from g_aegisbot.engine.strategy import portfolio_state
+    st = portfolio_state([{"symbol": "A/USDT:USDT", "side": "long", "contracts": 1.0, "entryPrice": 100.0}], trades=[])
+    assert st.open_risk == pytest.approx(3.0) and st.open_notional == 100.0 and st.longs == 1 and st.shorts == 0
+    assert portfolio_state([{"symbol": "A/USDT:USDT", "contracts": 1.0, "entryPrice": 100.0}]).longs == 1   # unknown side: both
+    assert portfolio_state([{"symbol": "A/USDT:USDT", "contracts": 1.0, "entryPrice": 100.0}]).shorts == 1
+
+
+async def test_gross_notional_cap_binds_at_high_leverage():
+    big = signal(0.15)
+    r = await plan_trade(profile(leverage=5), FakeAdapter(positions=[
+        {"symbol": "C0/USDT:USDT", "side": "short", "contracts": 0.15, "entryPrice": 50_000.0}]), big,
+        replace(P, max_aggregate_risk_pct=0.0), trades=[type("T", (), {"symbol": "C0/USDT:USDT", "stop_price": 49_000.0 + 2_000})()])
+    assert isinstance(r, TradePlan)
+    assert r.notional + 0.15 * 50_000 <= 5000 * 2.0 + 1e-6                  # 2x allocated capital is the ceiling

@@ -33,6 +33,7 @@ export interface Position {
   best_price: number;
   leverage: number;
   mode: string;
+  strategy?: string;
   opened_at: string;
 }
 
@@ -46,6 +47,7 @@ export interface Trade {
   fees: number;
   reason: string;
   mode: string;
+  strategy?: string;
   opened_at: string;
   closed_at: string;
 }

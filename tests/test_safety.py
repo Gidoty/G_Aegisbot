@@ -15,6 +15,7 @@ from g_aegisbot.engine import runner as runner_mod
 from g_aegisbot.engine.controls import GLOBAL, ControlStore
 from g_aegisbot.engine.paper import PaperExchange
 from g_aegisbot.exchange import BinanceFuturesAdapter, PositionModeError
+from g_aegisbot.exchange.binance_futures import PositionModeUnreadable
 from tests.fakes import minute_candles
 from tests.test_runner import SYM, Clock, hourly_with_forming, open_trades, positions, world  # noqa: F401
 
@@ -260,8 +261,8 @@ class FakeLive(PaperExchange):
         if self.fail_mode:
             raise self.fail_mode
 
-    async def market_order(self, symbol, side, amount, reduce_only=False):
-        res = await super().market_order(symbol, side, amount, reduce_only)
+    async def market_order(self, symbol, side, amount, reduce_only=False, **kw):
+        res = await super().market_order(symbol, side, amount, reduce_only, **kw)
         if self.timeout_after_fill and not reduce_only:
             raise ccxt.RequestTimeout("timed out after the fill")
         return res
@@ -331,44 +332,59 @@ async def test_position_mode_check_reads_binance_dual_side_flag():
             await a.assert_one_way_mode()
 
 
+def _mode_adapter(response):
+    a = BinanceFuturesAdapter("k", "s")
+
+    async def dual():
+        return response
+    a.exchange = SimpleNamespace(fapiPrivateGetPositionSideDual=dual)
+    return a
+
+
+@pytest.mark.parametrize("flag", [False, "false", "False", "FALSE"])
+async def test_an_explicit_false_confirms_one_way_mode(flag):
+    await _mode_adapter({"dualSidePosition": flag}).assert_one_way_mode()
+
+
+@pytest.mark.parametrize("flag", [True, "true", "True"])
+async def test_an_explicit_true_is_hedge_mode_and_is_refused(flag):
+    with pytest.raises(PositionModeError, match="Hedge Mode"):
+        await _mode_adapter({"dualSidePosition": flag}).assert_one_way_mode()
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"other": 1}, {"dualSidePosition": None}, {"dualSidePosition": "garbage"}, {"dualSidePosition": ""},
+    {"dualSidePosition": " false"}, {"dualSidePosition": "0"}, {"dualSidePosition": 0}, {"dualSidePosition": 1},
+    {"dualSidePosition": 0.0}, {"dualSidePosition": []}, {"dualSidePosition": ["false"]}, {"dualSidePosition": {}},
+    {"dualSidePosition": {"v": False}}, None, [], "false", 5,
+])
+async def test_a_missing_or_unexpected_answer_fails_closed_and_is_never_read_as_one_way(response):
+    with pytest.raises(PositionModeUnreadable):
+        await _mode_adapter(response).assert_one_way_mode()
+
+
 # ------------------------------------------------------------------ real adapter: stop order discovery
 async def test_fetch_stop_orders_keeps_only_reduce_only_stops_and_merges_trigger_listing():
-    a = BinanceFuturesAdapter("k", "s")
-    calls = []
-
-    async def fetch_open_orders(symbol, params=None):
-        calls.append(params)
-        if params == {"trigger": True}:
-            return [{"id": "9", "type": "STOP_MARKET", "reduceOnly": True, "stopPrice": 95.0, "side": "sell", "info": {}}]
-        return [
-            {"id": "1", "type": "limit", "reduceOnly": False, "price": 50, "side": "buy", "info": {}},
-            {"id": "2", "type": "stop_market", "reduceOnly": True, "stopPrice": 96.0, "side": "sell", "info": {}},
-            {"id": "3", "type": "stop_market", "reduceOnly": False, "stopPrice": 90.0, "side": "buy", "info": {}},
-        ]
-
-    a.exchange = SimpleNamespace(fetch_open_orders=fetch_open_orders)
+    """Same intent as before, but driven through the real ccxt parser (see tests/test_adapter_real_ccxt.py for the rest)."""
+    from tests.ccxt_real import algo_stop, make, regular_limit, regular_stop
+    a, rec = make({"regular": [regular_limit(orderId=1), regular_stop(orderId=2, stopPrice="96000"),
+                               regular_stop(orderId=3, reduceOnly=False, side="BUY", stopPrice="90000")],
+                   "algo": [algo_stop(algoId=9, triggerPrice="95000")]})
     found = await a.fetch_stop_orders("BTC/USDT:USDT")
-    assert {o["id"] for o in found} == {"2", "9"} and calls == [{}, {"trigger": True}]
-    assert {o["id"]: o["stopPrice"] for o in found} == {"2": 96.0, "9": 95.0}
+    assert {o["id"] for o in found} == {"2", "9"} and rec.names() == ["fapiPrivateGetOpenOrders", "fapiPrivateGetOpenAlgoOrders"]
+    assert {o["id"]: o["stopPrice"] for o in found} == {"2": 96000.0, "9": 95000.0}
 
 
-async def test_fetch_stop_orders_tolerates_an_unsupported_trigger_listing_but_not_a_network_error():
-    a = BinanceFuturesAdapter("k", "s")
-
-    async def trigger_unsupported(symbol, params=None):
-        if params:
-            raise ccxt.BadRequest("unsupported")
-        return [{"id": "2", "type": "stop_market", "reduceOnly": True, "stopPrice": 96.0, "side": "sell", "info": {}}]
-
-    a.exchange = SimpleNamespace(fetch_open_orders=trigger_unsupported)
-    assert [o["id"] for o in await a.fetch_stop_orders("X")] == ["2"]
-
-    async def down(symbol, params=None):
-        raise ccxt.RequestTimeout("timeout")
-
-    a.exchange = SimpleNamespace(fetch_open_orders=down)
-    with pytest.raises(ccxt.RequestTimeout):
-        await a.fetch_stop_orders("X")
+async def test_fetch_stop_orders_never_hides_a_failed_listing():
+    """Before: an unsupported conditional listing was skipped, which made every algo stop invisible. Now any listing
+    failure propagates, so the account is treated as unverified instead of 'has no stops'."""
+    import pytest as _pytest
+    from tests.ccxt_real import make
+    for method in ("fapiPrivateGetOpenAlgoOrders", "fapiPrivateGetOpenOrders"):
+        for failure in (ccxt.BadRequest("unsupported"), ccxt.RequestTimeout("timeout")):
+            a, _ = make(**{method: failure})
+            with _pytest.raises(type(failure)):
+                await a.fetch_stop_orders("BTC/USDT:USDT")
 
 
 # ------------------------------------------------------------------ dashboard data written by the runner

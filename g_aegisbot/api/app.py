@@ -3,8 +3,10 @@
 Run:  uvicorn --factory g_aegisbot.api.app:create_app_from_env --host 127.0.0.1 --port 8000
 
 The API never trades and never holds exchange connections. It reads and writes the database; the runner
-does the trading. Logins are Supabase JWTs. A login maps to a profile when profile.user_id equals the
-login's email (or Supabase user id), so create each profile with the person's login email as its user_id.
+does the trading. Logins are Supabase JWTs. A login maps to a profile by the immutable Supabase user id
+(profiles.auth_user_id). The first login of a person whose invite email matches an unbound, non-admin profile
+binds that id (atomically) once Supabase Auth confirms that user owns that email; the email is not consulted afterwards.
+Admin profiles are bound by the operator CLI.
 Nothing secret is ever returned: API keys go in, only 'stored: true' comes out.
 """
 from __future__ import annotations
@@ -22,11 +24,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 
 from g_aegisbot import audit
 from g_aegisbot.api import billing as bill
-from g_aegisbot.api.auth import AuthError, Authenticator
+from g_aegisbot.api import identity as bind
+from g_aegisbot.api.auth import AuthError, Authenticator, SupabaseEmailChecker
 from g_aegisbot.api.schemas import AdminCreateIn, AdminPatchIn, ExtendIn, KeysIn, KillIn, ResumeIn, SettingsIn
 from g_aegisbot.api.settings import ApiSettings, load_api_settings
 from g_aegisbot.db.models import UserProfile
@@ -78,12 +81,20 @@ def profile_view(p: UserProfile, ctrl, now: datetime | None = None) -> dict:
     }
 
 
+LINK_FAILED = ("This login could not be linked to a G-Aegisbot profile. If you were invited, confirm your email address "
+               "and sign in again. Administrator accounts are linked by the operator ('bind-login'), and so is any "
+               "account when automatic linking is switched off.")
+
+
 def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator | None = None, key_checker=None,
-               billing_client=None, clock=None) -> FastAPI:
+               billing_client=None, clock=None, email_checker=None) -> FastAPI:
     clock = clock or (lambda: datetime.now(timezone.utc))
     app = FastAPI(title="G-Aegisbot API", docs_url="/api/docs" if settings.docs else None,
                   redoc_url=None, openapi_url="/api/openapi.json" if settings.docs else None)
     auth = authenticator or (Authenticator.from_settings(settings) if settings.auth_configured else None)
+    # Trusted Supabase Auth lookup for first-login email binding. None means automatic email binding is OFF.
+    checker = email_checker or (SupabaseEmailChecker(settings.supabase_url, settings.supabase_anon_key)
+                                if settings.email_binding_enabled else None)
     controls = ControlStore(sf)
     check_key = key_checker or check_api_key
     limiter = RateLimiter(5, 60)
@@ -118,13 +129,43 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
             ident = auth.verify(header[7:].strip())
         except AuthError:
             raise HTTPException(401, "Your login is invalid or has expired. Sign in again.")
+        return resolve_profile(ident, header[7:].strip())
+
+    def resolve_profile(ident, token: str) -> Principal:
+        """Map a verified login to a profile by the IMMUTABLE Supabase user id (auth_user_id).
+
+        Bound profiles are found by `sub` only; the email is ignored, so a different account presenting the same email
+        gets nothing. A profile with no bound id can be claimed once:
+          * a profile whose user_id IS the Supabase id matches on the signed `sub` alone, or
+          * a NON-ADMIN profile whose invite email matches, but only when Supabase Auth itself (a server-side lookup
+            with this token) confirms the same user id owns that same email and has confirmed it.
+        Nothing in the token (email, user_metadata) is accepted as proof of ownership. Admin profiles, an unavailable
+        lookup, and a deployment without SUPABASE_ANON_KEY are all refused with the same answer: the operator binds
+        those with `python -m g_aegisbot.admin bind-login`."""
+        sub = ident.sub
         with sf() as s:
-            rows = list(s.scalars(select(UserProfile).where(
-                func.lower(UserProfile.user_id).in_([x for x in (ident.email, ident.sub.lower()) if x]))))
-        if not rows:
-            raise HTTPException(403, "This login has no G-Aegisbot profile. Ask the administrator to create one "
-                                     "using your login email as the user id.")
-        return Principal(rows[0].user_id, rows[0].is_admin)
+            row = s.scalar(select(UserProfile).where(UserProfile.auth_user_id == sub))
+            if row is not None:
+                return Principal(row.user_id, row.is_admin)
+        cand, how = bind.find_unbound(sf, sub=sub, email=ident.email)
+        if cand is None:
+            raise HTTPException(403, LINK_FAILED)
+        if how == "email":
+            if cand.is_admin:
+                log.warning("refused email binding of admin profile #%s; use bind-login", cand.id)
+                raise HTTPException(403, LINK_FAILED)
+            if checker is None:
+                log.warning("email binding refused for profile #%s: SUPABASE_URL / SUPABASE_ANON_KEY are not set, so "
+                            "the email cannot be confirmed server-side", cand.id)
+                raise HTTPException(403, LINK_FAILED)
+            if not checker.confirmed(token, sub=sub, email=ident.email):
+                raise HTTPException(403, LINK_FAILED)
+        if not bind.claim_profile(sf, cand.id, sub, ident.email):
+            log.warning("login %s lost the race to claim profile #%s or its id is bound elsewhere", sub, cand.id)
+            raise HTTPException(403, "This profile is already linked to a different login.")
+        audit.record(sf, actor=cand.user_id, action="login_bound", target=cand.user_id,
+                     detail=f"auth_user_id={sub} via {how}")
+        return Principal(cand.user_id, cand.is_admin)
 
     def admin(p: Principal = Depends(principal)) -> Principal:
         if not p.is_admin:
@@ -169,7 +210,7 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
             rows = list(s.scalars(select(OpenTrade).where(OpenTrade.user_id == p.user_id).order_by(OpenTrade.opened_at)))
         return [{"symbol": t.symbol, "side": "long" if t.side == "buy" else "short", "entry_price": t.entry_price,
                  "stop_price": t.stop_price, "best_price": t.extreme_price, "leverage": t.leverage, "mode": t.mode,
-                 "opened_at": as_utc(t.opened_at).isoformat()} for t in rows]
+                 "strategy": t.strategy, "opened_at": as_utc(t.opened_at).isoformat()} for t in rows]
 
     @app.get("/api/me/trades")
     def my_trades(limit: int = 50, p: Principal = Depends(principal)):
@@ -178,7 +219,7 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
                                   .order_by(TradeLog.id.desc()).limit(max(1, min(limit, 500)))))
         return [{"symbol": t.symbol, "side": "long" if t.side == "buy" else "short", "amount": t.amount,
                  "entry_price": t.entry_price, "exit_price": t.exit_price, "pnl": t.pnl, "fees": t.fees,
-                 "reason": t.exit_reason, "mode": t.mode, "opened_at": as_utc(t.opened_at).isoformat(),
+                 "reason": t.exit_reason, "mode": t.mode, "strategy": t.strategy, "opened_at": as_utc(t.opened_at).isoformat(),
                  "closed_at": as_utc(t.closed_at).isoformat()} for t in rows]
 
     @app.get("/api/me/equity")
@@ -280,7 +321,7 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
                 raise ValueError
         except ValueError:
             raise HTTPException(400, "Malformed body.")
-        if not bill.verify_signature(payload, request.headers.get("x-nowpayments-sig"), settings.now_ipn_secret):
+        if not bill.verify_signature(raw, request.headers.get("x-nowpayments-sig"), settings.now_ipn_secret):
             log.warning("IPN rejected: bad signature")
             raise HTTPException(401, "Bad signature.")
         result = await run_in_threadpool(bill.process_ipn, sf, payload, clock())

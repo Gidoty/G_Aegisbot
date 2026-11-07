@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ago, daysLeft, pct, price, shortSymbol, signedUsd, tone, usd } from "./format";
+import { ago, daysLeft, pct, price, shortSymbol, signedUsd, strategyLabel, tone, usd } from "./format";
 
 describe("format", () => {
   it("formats money with sign and grouping", () => {
@@ -35,5 +35,16 @@ describe("format", () => {
     expect(ago(null, now)).toBe("never");
     expect(daysLeft("2026-03-15T12:00:00Z", now)).toBe(10);
     expect(daysLeft(null, now)).toBeNull();
+  });
+});
+
+describe("strategyLabel", () => {
+  it("names known strategies and never guesses", () => {
+    expect(strategyLabel("breakout")).toBe("Breakout");
+    expect(strategyLabel("trend")).toBe("Trend");
+    expect(strategyLabel("adopted")).toBe("Adopted");
+    expect(strategyLabel(undefined)).toBe("unknown");
+    expect(strategyLabel("")).toBe("unknown");
+    expect(strategyLabel("future-x")).toBe("future-x");
   });
 });

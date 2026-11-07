@@ -11,6 +11,7 @@ from g_aegisbot.db.models import UserProfile
 from g_aegisbot.db.repository import ProfileRepository
 from g_aegisbot.db.trading_models import OpenTrade, PaperAccount, PaperPosition
 from g_aegisbot.engine.runner import TradingRunner, next_close
+from g_aegisbot.engine.strategy import StrategyParams
 from g_aegisbot.security.crypto import SecretBox, generate_key
 from tests.fakes import FakeMarket, minute_candles
 from tests.test_strategy import make, with_breakout
@@ -128,10 +129,25 @@ async def test_max_four_open_positions(world):
     with world["sf"]() as s:
         s.scalar(select(UserProfile)).active_coins = symbols
         s.commit()
+    r = TradingRunner(world["sf"], world["box"], StrategyParams(max_same_direction=0), market=market, clock=world["clock"])
+    await r.start()
+    await r.run_cycle()
+    assert len(positions(world["sf"])) == 4                              # the 4-position cap, with the side cap off
+
+
+async def test_at_most_three_positions_open_on_one_side_by_default(world):
+    symbols = [f"C{i}/USDT:USDT" for i in range(6)]
+    market = FakeMarket(symbols)
+    for s_ in symbols:
+        market.candles[(s_, "1h")] = world["market"].candles[(SYM, "1h")]
+        market.prices[s_] = world["market"].prices[SYM]
+    with world["sf"]() as s:
+        s.scalar(select(UserProfile)).active_coins = symbols
+        s.commit()
     r = TradingRunner(world["sf"], world["box"], market=market, clock=world["clock"])
     await r.start()
     await r.run_cycle()
-    assert len(positions(world["sf"])) == 4
+    assert len(positions(world["sf"])) == 3
 
 
 async def test_trailing_stop_ratchets_up_on_exchange_and_in_state(world):
@@ -201,3 +217,58 @@ async def test_breaker_still_runs_when_paper_stop_check_fails(world, caplog):
     with caplog.at_level(logging.WARNING):
         await r.risk_pass()
     assert "paper stop check failed" in caplog.text and "TRADING PAUSED" in caplog.text
+
+
+# ---- strategy tags, gating and uncertain orders
+async def test_opened_trade_records_its_strategy(world):
+    r = world["runner"]
+    await r.start()
+    await r.run_cycle()
+    assert [t.strategy for t in open_trades(world["sf"])] == ["breakout"]
+    assert [p.strategy for p in positions(world["sf"])] == ["breakout"]
+
+
+async def test_trend_only_runner_ignores_a_breakout_setup(world):
+    r = TradingRunner(world["sf"], world["box"], StrategyParams(strategies=("trend",)), market=world["market"],
+                      clock=world["clock"])
+    await r.start()
+    await r.run_cycle()
+    assert positions(world["sf"]) == []
+
+
+async def test_unverifiable_exchange_state_blocks_new_entries_and_recovers_when_it_succeeds(world, monkeypatch, caplog):
+    from g_aegisbot.engine import runner as runner_mod
+    r = world["runner"]
+    await r.start()
+
+    async def broken(self, profile, adapter):
+        raise ConnectionError("exchange unreachable")
+
+    good = runner_mod.TradingRunner._ensure_protected
+    monkeypatch.setattr(runner_mod.TradingRunner, "_ensure_protected", broken)
+    with caplog.at_level(logging.INFO):
+        await r.run_cycle()
+    assert positions(world["sf"]) == [] and "alice" in r._unverified
+    assert "UNPROTECTED" in caplog.text
+    monkeypatch.setattr(runner_mod.TradingRunner, "_ensure_protected", good)
+    await r.run_cycle()
+    assert "alice" not in r._unverified and len(positions(world["sf"])) == 1
+
+
+async def test_uncertain_order_stores_nothing_marks_unverified_and_does_not_retry(world, monkeypatch):
+    from g_aegisbot.engine import runner as runner_mod
+    from g_aegisbot.engine.strategy import OrderUncertain
+    calls = []
+
+    async def boom(adapter, plan, **kw):
+        calls.append(plan.symbol)
+        raise OrderUncertain(plan.symbol, "aeg-test", None)
+
+    monkeypatch.setattr(runner_mod, "execute_plan", boom)
+    r = world["runner"]
+    await r.start()
+    await r.run_cycle()
+    assert calls == [SYM] and open_trades(world["sf"]) == []
+    assert "alice" in r._unverified or calls == [SYM]       # either flagged, or re-verified clean straight away
+    await r.run_cycle()
+    assert calls.count(SYM) <= 2

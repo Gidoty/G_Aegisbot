@@ -37,6 +37,8 @@ class ProfileRepository:
         # Testnet profiles default the cap to their reference balance so paper trading works at once.
         if fields.get("trading_mode", "testnet") == "testnet" and "max_wallet_cap_usdt" not in fields:
             fields["max_wallet_cap_usdt"] = fields.get("virtual_balance", DEFAULT_TESTNET_BALANCE)
+        if "@" in user_id and "login_email" not in fields:
+            fields["login_email"] = user_id.strip().lower()           # invite email; the first login binds the Supabase id
         profile = UserProfile(user_id=user_id, is_admin=is_admin, **fields)
         self.session.add(profile)
         self.session.commit()

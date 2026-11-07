@@ -258,6 +258,15 @@ async def download_symbol(exchange, symbol: str, w: Window, *, allow_late_start:
     return rows_to_frame(symbol, rows, w, allow_late_start=allow_late_start)
 
 
+async def earliest_candle_ms(exchange, symbol: str, timeframe: str, *, retries: int = 5, sleep=asyncio.sleep) -> int:
+    """Open time of the first candle the exchange holds for a symbol. Raises DataIntegrityError if it returns nothing."""
+    batch = await with_retries(lambda: exchange.fetch_ohlcv(symbol, timeframe, since=0, limit=1), symbol=symbol,
+                               retries=retries, sleep=sleep)
+    if not batch:
+        raise DataIntegrityError(symbol, ["the exchange returned no candles, so the listing date cannot be established"])
+    return int(batch[0][0])
+
+
 # --------------------------------------------------------------------------- cache
 def cache_path(cache_dir: str | Path, symbol: str, timeframe: str) -> Path:
     return Path(cache_dir) / f"{symbol.replace('/', '_').replace(':', '_')}_{timeframe}.csv"
