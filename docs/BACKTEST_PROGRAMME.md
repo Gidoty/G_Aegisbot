@@ -33,6 +33,20 @@ python -m g_aegisbot.backtest --individually --from-listing --end 2026-11-06 --c
 ```
 Each pair starts 25 days after its own listing and needs 500 candles of its own before its first signal.
 
+## Test 4: slow-timeframe study (4h and 1d), development period only
+Pre-registered in `docs/STRATEGY_ACCEPTANCE.md` section 6.5. Run from the tag `prereg-slow-timeframe-v1` (`git fetch --tags &&
+git checkout prereg-slow-timeframe-v1`, then check `git rev-parse HEAD`). One run per candidate, no re-runs except after a crash.
+```bash
+SYMS="BTC/USDT:USDT ETH/USDT:USDT SOL/USDT:USDT BNB/USDT:USDT XRP/USDT:USDT LINK/USDT:USDT ADA/USDT:USDT AVAX/USDT:USDT NEAR/USDT:USDT DOGE/USDT:USDT DOT/USDT:USDT"
+for tf in 4h 1d; do for s in breakout trend; do
+  python -m g_aegisbot.backtest --start 2021-11-06 --end 2024-05-07 --timeframe $tf --strategies $s --funding historical \
+    --allow-late-start --out backtests/slow/$tf-$s --symbols $SYMS
+done; done
+python -m g_aegisbot.backtest.devscreen --candidate S-B4 --run <folder holding summary.json of the 4h breakout run>
+```
+Only candidates whose base screen says `STRESS_RUN_NEEDED` get a stress run (`--slippage-scale 2.0 --fee-scale 1.2`, same other
+options) and then `devscreen ... --stress-run <that folder>`. Do not look at any other period.
+
 ## Stress and sanity runs
 ```bash
 python -m g_aegisbot.backtest --start 2024-08-21 --slippage-scale 2.0 --out backtests/stress

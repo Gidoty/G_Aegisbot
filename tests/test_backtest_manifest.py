@@ -464,7 +464,7 @@ def test_canonical_json_is_stable_and_handles_infinity_and_numpy_scalars():
 def test_the_acceptance_protocol_defines_every_criterion_and_the_required_rules():
     text = (Path(mf.REPO_ROOT) / mf.PROTOCOL_DOC).read_text().lower()
     for needle in [f"| c{i} |" for i in range(1, 14)] + [
-            "draft v0.2", "declaration", "has not been independently verified", "2019-09-08", "2021-11-06", "forward paper trading is operational",
+            "draft v0.3", "slow-timeframe study", "infeasible_under_c1", "prereg-slow-timeframe-v1", "0.05 / max(3, k)", "declaration", "has not been independently verified", "2019-09-08", "2021-11-06", "forward paper trading is operational",
             "one trade is one completed position lifecycle", "partial entries", "truncated", "98.3%", "alpha 0.017",
             "equity-path reconstruction", "variant register", "block-length", "paired block bootstrap", "inconclusive",
             "never a pass", "not replaced", "unclassified", "actual binance leverage-bracket", "burns", "acceptance_eligible",

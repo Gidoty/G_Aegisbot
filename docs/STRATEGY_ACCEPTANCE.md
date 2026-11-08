@@ -1,6 +1,9 @@
 # Strategy acceptance protocol
 
-**Status: DRAFT v0.2 for independent review. It is not approved and not frozen. No result may be judged against it yet.**
+**Status: DRAFT v0.3 for independent review. It is not approved and not frozen. No result may be judged against it yet.**
+
+v0.3 adds section 6.5 (the slow-timeframe study: candidate register, development screen, promotion and stopping rules). It
+changes no acceptance criterion. v0.2 had no approval and no confirmation result, so nothing was burned by the edit.
 
 A protocol version is *approved* only when a person writes an approval record
 (`docs/STRATEGY_ACCEPTANCE.approval.json`) that names this exact file by its SHA-256, and *frozen* when a freeze record
@@ -128,6 +131,54 @@ Every run is registered with its experiment id, candidate, parameter hash, perio
 distinct strategy and parameter variants examined on development and validation data, how many were promoted to confirmation
 candidates, and that parameters were not chosen from results. A variant promoted after looking at data is a new candidate and
 raises the number used in the confidence level.
+
+### 6.5 The slow-timeframe study (pre-registered)
+**Why.** On 2021-11-06 to 2026-11-06, 1h, 11 pairs, the three candidates lost 77% to 90% (profit factor 0.78 to 0.87). Gross
+expectancy was negative for all three before fees and funding, so costs are part of the loss but not the whole of it. The
+study asks one narrow question: do the same rules, with every parameter unchanged, work on slower bars, where there is less
+noise and far fewer trades to pay for? Nothing else is being tried.
+
+**Fixed before any run.** Strategy parameters are the unchanged defaults of `StrategyParams`; only `timeframe` differs. Universe:
+the 11 survivors of Test 1 (BTC, ETH, SOL, BNB, XRP, LINK, ADA, AVAX, NEAR, DOGE, DOT), leverage 3x, base costs, historical
+funding, the flat 0.5% maintenance-margin default (exploratory), `--allow-late-start` (a pair joins after its own warm-up of
+500 candles), breaker on, one run per candidate on the development period 2021-11-06 to 2024-05-07 only. Nothing is read from
+the confirmation period.
+
+| ID | Strategies | Timeframe | Parameter hash (`digest(StrategyParams(...))`) |
+|---|---|---|---|
+| S-B4 | breakout | 4h | `33227d96efcc60f3e584b6f6d36076db6e6983404f6108ac1aea40b9e52bbaf3` |
+| S-T4 | trend | 4h | `d045b4e1222e73869ab8b5edd5fb47159cf08857b5dea7d4ce960df56110b58f` |
+| S-B1D | breakout | 1d | `281ba97223612afb96509f9f480dd1a740e07cb791970613d73294e5a860820e` |
+| S-T1D | trend | 1d | `ef83624e91e500e00c2c762bd65b78b76a63babc65a34796ffa1497ad60e32b9` |
+| S-C4 | breakout + trend | 4h | `b2a81b16493c30ed8554f356dcd5a7ea3a43d1cf81a387fa6769a4eb402ed992` (only if S-B4 and S-T4 are both promoted) |
+| S-C1D | breakout + trend | 1d | `7104a60f5a8c1599b72c77054600adf5360b3416da8d928afe5906cc463921d7` (only if S-B1D and S-T1D are both promoted) |
+
+**Variant register (6.4).** Examined before this study: the three 1h variants of Test 1 (breakout, trend, combined), plus the
+original breakout baseline. This study adds 4 variants, or up to 6 if both combined candidates qualify to run. All are counted.
+Parameters were not chosen from results: the only change from Test 1 is the timeframe.
+
+**Development screen (`g_aegisbot.backtest.devscreen`, applied mechanically, point estimates, completed trades only).** All must hold:
+* **P1 feasibility:** at least 600 completed trades. The confirmation period needs 300 (C1) and, because many pairs had not yet
+  listed, has roughly half the pair-days of the development period. This is an assumption about listing dates, stated here.
+  A candidate that fails P1 is recorded as `INFEASIBLE_UNDER_C1`: it says nothing about the edge and it is not promoted.
+* **P2:** net expectancy per trade above 0. **P3:** profit factor at least 1.30. **P4:** maximum drawdown of the daily
+  marked-to-market equity at most 25%.
+* **P5 (only for candidates that pass P1 to P4):** the same run with slippage x2 and taker fee x1.2 (`--slippage-scale 2.0
+  --fee-scale 1.2`) still has net expectancy above 0 and profit factor above 1.0.
+
+**Sequence.** Pass P1 to P5 on development: one validation run (2024-05-07 to 2026-11-06) needing at least 200 completed trades
+and a positive net expectancy. Pass that: signed approval of the protocol, a freeze record, one confirmation run, judged by
+section 7 unchanged (including C1 at 300 trades and the 98.3% bootstrap bounds). Failing any step ends that candidate.
+
+**Confidence level with several promoted candidates.** 98.3% (alpha 0.017) corresponds to 0.05 / 3. If `k` candidates are
+promoted to confirmation, alpha is 0.05 / max(3, k), so 4 candidates give 98.75% and 5 give 99%. It is never loosened.
+
+**Stopping rule.** If no candidate is promoted to confirmation, or none passes it, the rule family is rejected. No variant is
+added to rescue it (for example a changed exit rule), no requirement is weakened, and strategy research on it stops.
+
+**Pre-registration.** This section, the screen's code and its tests are committed and tagged `prereg-slow-timeframe-v1` before
+any run. The runs must be made from that tag (the manifest records the commit and that the code equals it; `devscreen` refuses
+otherwise). A git tag is dated evidence, not tamper-proof; it becomes stronger once the owner signs the commit.
 
 ## 7. Acceptance criteria (D) with exact calculations
 All hold on the **confirmation** run unless stated. Calculations use only completed trades unless stated (section 5).
