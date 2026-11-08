@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Literal
@@ -65,6 +66,8 @@ class StrategyParams:
     max_aggregate_risk_pct: float = 0.04    # sum of open risk at current stops, as a share of allocated capital (0 disables)
     max_same_direction: int = 3             # most positions allowed on one side at once (0 disables); alts are highly correlated
     max_gross_notional_x: float = 2.0       # total open notional as a multiple of allocated capital (0 disables)
+    # --- entry price guard (see entry_price_problem). Fixed a priori at a quarter of the 2 ATR stop distance; never tuned.
+    max_entry_chase_atr: float = 0.5        # skip the entry if price ran this many ATR beyond the signal close, in the trade's favour (0 disables)
     # --- strategy B: trend-following pullback (see docs/STRATEGIES.md). Fixed a priori, never tuned on results.
     pull_ema: int = 20
     trend_slope_bars: int = 24
@@ -291,6 +294,26 @@ def portfolio_state(positions: list[dict], trades=(), unprotected_loss_pct: floa
     return PortfolioState(risk, notional, longs, shorts)
 
 
+def entry_price_problem(sig: Signal, price: float, p: StrategyParams) -> str | None:
+    """Why an entry at `price` must not be sent, or None. The size and the stop come from the signal candle's close; the
+    order fills later. Two cases are refused: the price is already at or through the stop (the exchange would refuse the
+    stop order and the position would have to be closed again), or it has run more than `max_entry_chase_atr` ATR beyond
+    the close in the trade's favour (the stop would sit far from the fill and the risk the size assumed would be wrong).
+    A price that is better than the close is always fine. Used by the live planner and, with the next bar's open, by the
+    backtester, so both skip exactly the same entries."""
+    if not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
+        return "the current price is not usable"
+    long = sig.side == "buy"
+    if (long and price <= sig.stop_price) or (not long and price >= sig.stop_price):
+        return f"price {price:.6g} is already at or through the stop {sig.stop_price:.6g}"
+    if p.max_entry_chase_atr:
+        chase = (price - sig.entry_price) if long else (sig.entry_price - price)
+        if chase > p.max_entry_chase_atr * sig.atr:
+            return (f"price has moved {chase / sig.atr:.2f} ATR beyond the signal close "
+                    f"(limit {p.max_entry_chase_atr:g} ATR); not chasing")
+    return None
+
+
 def compute_size(
     sig: Signal, *, leverage: int, allocated: float, used: float, free: float, open_positions: int,
     p: StrategyParams = StrategyParams(), round_amount=None, min_amount: float | None = None,
@@ -369,6 +392,12 @@ async def plan_trade(profile, adapter, sig: Signal, p: StrategyParams = Strategy
     positions = await adapter.fetch_open_positions()
     if any(pos.get("symbol") == sym for pos in positions):
         return Skip(sym, "position already open")
+    try:
+        last = float(await adapter.fetch_last_price(sym))
+    except Exception as exc:                                # fail closed: no price, no entry
+        return Skip(sym, f"current price could not be read ({type(exc).__name__})")
+    if (why := entry_price_problem(sig, last, p)):
+        return Skip(sym, why)
 
     bal = await adapter.fetch_usdt_balance()
     ex = adapter.exchange

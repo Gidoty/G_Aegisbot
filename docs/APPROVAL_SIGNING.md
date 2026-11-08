@@ -1,8 +1,42 @@
-# Approval and freeze signing: what exists, and the decisions still open
+# Approval and freeze signing: how it works, and what only you can do
 
-Status: verification infrastructure only. No key has been generated, no public key is pinned, and no approval or freeze record
-has been signed. Until the decisions below are made, every approval and every freeze record is rejected, so no acceptance run
-can be eligible.
+Status: the verification code and an offline signer exist (`g_aegisbot/backtest/signer.py`). **No key has been generated, no
+public key is pinned, and nothing has been signed.** Until you do the steps in "What only you can do", every approval and
+every freeze record is rejected, so no acceptance run can be eligible. That is the intended safe state.
+
+## Decisions taken (the builder's recommendation, in force until you change them)
+1. **One approver: you.** One signature is required. A second approver can be added later (more `approver` keys and a rule
+   that two must sign); it is not needed while there is a single owner.
+2. **The private key lives only on your own trusted device**, encrypted with a passphrase of at least 12 characters, backed up
+   offline. Never on the VPS, never in this repository, never in a cloud session or chat. The signer refuses any key path
+   inside the repository and any key file other users can read.
+3. **Only you change the pinned public-key list**, by your own commit, with GitHub branch protection (a required review by you,
+   no direct pushes) on `docs/STRATEGY_ACCEPTANCE.trusted_keys.json`, the approval record and the freeze records. The
+   implementer, human or AI, must not be able to edit that file unreviewed.
+4. **Key lifetime: one year** (`--years`), with rotation by adding the new key before the old one expires. Verification uses the
+   time of checking, so an expired key stops verifying its old records. That is the safe default (it fails closed); re-sign
+   the records with the new key after rotation.
+5. **Revocation:** set `"revoked": true` for the key in the pinned file; records it signed stop verifying.
+6. **External anchor:** commit the signed approval and freeze records on a signed commit and tag it; write the tag and commit id
+   in every report. The records' integrity then rests on repository access control, not on this code.
+7. **Procedure:** the signer commands below. Each signature is a deliberate act: signing an approval shows the protocol's
+   SHA-256 and asks you to type its first eight characters.
+
+## What only you can do (commands run on your own device, in a checkout of this repository)
+```bash
+python -m g_aegisbot.backtest.signer keygen --out ~/aegis-keys/approver.pem --label "owner 2026" --years 1
+```
+Copy the printed public entry into `docs/STRATEGY_ACCEPTANCE.trusted_keys.json` as `{"version": 1, "keys": [ ...entry... ]}`
+and commit it yourself. Back up `approver.pem` offline. Then, once you have read `docs/STRATEGY_ACCEPTANCE.md` and accept it:
+```bash
+python -m g_aegisbot.backtest.signer sign-approval --key ~/aegis-keys/approver.pem --approved-by "Your Name" --version v1.0
+python -m g_aegisbot.backtest.signer verify --purpose approval --in docs/STRATEGY_ACCEPTANCE.approval.json
+```
+After the freeze record is built (unsigned) for an acceptance run:
+```bash
+python -m g_aegisbot.backtest.signer sign-freeze --key ~/aegis-keys/approver.pem --in freeze_unsigned.json --out freeze.json
+```
+Changing the protocol document after approval withdraws the approval automatically (the hash no longer matches).
 
 ## What the code does (g_aegisbot/backtest/signing.py, freeze.py)
 * A record is approved or frozen only if it carries an **Ed25519 signature** that verifies against a key listed in
@@ -14,32 +48,13 @@ can be eligible.
 * The approval record must be a regular file (not a link), small, valid UTF-8, strict JSON without duplicate keys or NaN, and
   decode to an object with exactly the expected fields. `null`, booleans, numbers, strings and arrays are refused. `approved` is
   true only after every step succeeds explicitly.
-* Nothing in the repository creates a private key, stores one, or signs a record. The library can only verify. The helper that
-  signs (`signing.sign_record`) exists for an offline signer and for tests that use throw-away in-memory keys.
+* The verifying code never creates, stores or signs with a key. Signing is done only by the separate offline signer
+  (`signer.py`), which the backtester does not import, and by tests that use throw-away in-memory keys.
 
 ## What a signature does and does not prove
 It proves that someone holding the private key signed exactly these bytes. It does not prove who that person is, that they
 reviewed the protocol, or that the key was not copied. Identity rests on custody of the key and on who may change the pinned
 list. A signature also does not stop a signer from approving a bad protocol.
-
-## Decisions required from you before anything is signed or pinned
-1. **Who is the approver?** One named person, or several. The role in the trusted-keys file is `approver`. Decide whether one
-   signature is enough or two independent ones are required (the code currently accepts one).
-2. **Where does the private key live?** Suggested: on a device or hardware token you control, never on the VPS, never in this
-   repository, never in a cloud session. Decide how it is backed up and who may use it.
-3. **Who may change the pinned public-key list?** The list is the root of trust. If the implementer can edit it, the
-   implementer can approve their own work. Suggested: only the approver commits changes to it, on a signed commit, and the
-   commit that pins the key is reviewed by someone other than the implementer.
-4. **Key lifetime and rotation.** `valid_from` and `valid_until` are checked at the moment a record is verified, so a record
-   signed by a key that has since expired stops verifying. Decide whether that is acceptable or whether verification should use
-   the signing time (which a record can claim falsely unless it is anchored externally).
-5. **Revocation.** Decide how a compromised key is marked (`revoked: true`) and what happens to records it signed.
-6. **External anchor.** A signature does not stop an approved record from being deleted or replaced by an earlier one. Suggested:
-   commit the approval and freeze records on a signed commit, tag it, and write the tag and commit id into the report. That relies
-   on repository access control, not on this code.
-7. **Signing procedure.** Decide the offline steps (build the unsigned payload with `freeze.build_approval_payload`, sign on the
-   trusted device, add the record, review the diff, commit). A command-line tool for this is deliberately not provided until the
-   custody decisions are made.
 
 ## Not covered by this phase
 Signing of the evaluator's verdicts, the run register and consumption tokens, and per-candidate confirmation limits belong to

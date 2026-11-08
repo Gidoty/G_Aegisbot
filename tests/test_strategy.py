@@ -142,6 +142,7 @@ class FakeAdapter:
         self.fail_stop = False
 
     async def fetch_usdt_balance(self): return self.bal
+    async def fetch_last_price(self, s): return getattr(self, "price", 50_000.0)     # the price signal() is built at
     async def fetch_open_positions(self, symbols=None): return self.positions + self.opened
     async def configure_symbol(self, s, lev): self.calls.append(("configure", s, lev))
     async def market_order(self, s, side, amt, reduce_only=False, **kw):

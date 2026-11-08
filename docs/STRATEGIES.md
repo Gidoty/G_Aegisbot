@@ -63,6 +63,16 @@ Rules around the ranking:
 * Positions the bot finds on the exchange without a record are tagged `adopted`; they get a stop and are managed, but
   belong to neither strategy.
 
+## Entry price guard
+Size and stop are fixed from the signal candle's close (`entry = close`, `stop = close -/+ 2 ATR`); the market order fills
+later. `strategy.entry_price_problem` refuses the entry when the price at that moment (live: the last traded price; backtest:
+the next bar's open) is already at or through the stop, or has run more than `max_entry_chase_atr` (0.5) ATR beyond the
+close in the trade's favour. Without the first check the exchange would reject the stop order and the bot would have to
+close the position it had just opened; without the second the stop would sit much further from the fill than the size
+assumed. A better price than the close is always accepted. If the live price cannot be read the entry is skipped. The limit
+is a quarter of the stop distance, fixed in advance and never tuned on results. Skipped entries are counted in the backtest
+as `entry price ran away`.
+
 ## Closed candles in the live scan
 A candle counts as closed once its time is over (`open + timeframe <= now`), not because it is not the last row, so the
 scan works whether or not the exchange has already listed the new forming candle. If the newest closed candle is not the

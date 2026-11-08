@@ -49,7 +49,7 @@ from g_aegisbot.costs import FUNDING_RATE_8H, MAKER_FEE, TAKER_FEE, slippage_rat
 from g_aegisbot.engine import risk
 from g_aegisbot.engine.strategies import candidate_mask, evaluate_symbol, exit_signal, validate_strategies
 from g_aegisbot.engine.strategy import (
-    PortfolioState, StrategyParams, TrailingStop, compute_indicators, compute_size, signal_rank_key,
+    PortfolioState, StrategyParams, TrailingStop, compute_indicators, compute_size, entry_price_problem, signal_rank_key,
 )
 
 MAINT_MARGIN = 0.005
@@ -285,6 +285,9 @@ class Backtester:
                 i = self.pidx[s][k]
                 if i < 0:
                     still_pending.append((sig, plan))
+                    continue
+                if entry_price_problem(sig, float(self.arr[s]["open"][i]), p):      # same rule as the live planner
+                    skips["entry price ran away"] += 1
                     continue
                 entry = self._fill(s, self.arr[s]["open"][i], sig.side == "buy")
                 margin = plan.amount * entry / cfg.leverage
