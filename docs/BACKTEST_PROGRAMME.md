@@ -43,7 +43,10 @@ python -m g_aegisbot.backtest --synthetic --years 1   # pipeline check only; the
 it a flat 0.5% maintenance rate is used and the report states that.
 
 ## What each run writes
-`summary.json` (metrics, per-symbol, per-strategy, per-exit-reason, assumptions), `trades.csv`, `equity.csv`. Read the
+`summary.json` (metrics, per-symbol, per-strategy, per-exit-reason, assumptions), `trades.csv`, `equity.csv`, and `manifest.json`
+(code hash, library versions, full parameters and configuration, per-symbol data and funding hashes, the acceptance-protocol
+hash, and the hashes of the three output files; `experiment_id` is identical for identical experiments). Judge results only
+against `docs/STRATEGY_ACCEPTANCE.md`. Do not use `--split` for decision runs until the holdout lock-box lands. Read the
 assumptions block before the numbers. Compare the gross and net columns: if gross is positive and net negative, costs
 are the problem; if both are negative, the signal has no edge.
 

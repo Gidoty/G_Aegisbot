@@ -33,8 +33,13 @@ from g_aegisbot.backtest.data import (
 )
 from g_aegisbot.backtest.funding import download_funding_all
 from g_aegisbot.backtest.liquidation import load_liquidation_config
+from g_aegisbot.backtest import freeze as fz
+from g_aegisbot.backtest.manifest import (
+    ARG_CLASSIFICATION, attach_outputs, build_manifest, sha256_file, write_manifest,
+)
 from g_aegisbot.backtest.simulator import Backtester, BacktestConfig
 from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE
+from g_aegisbot.costs import TAKER_FEE
 from g_aegisbot.engine.strategies import ALL_STRATEGIES, validate_strategies
 from g_aegisbot.engine.strategy import StrategyParams
 
@@ -91,7 +96,7 @@ def report(label: str, res, a, frames_n: int) -> None:
         print(f"    {k:<12} {res.notes['assumptions'][k]}")
 
 
-def _save(root: Path, label: str, res, extra: dict) -> Path:
+def _save(root: Path, label: str, res, extra: dict, ctx: dict | None = None) -> Path:
     out = root / label
     out.mkdir(parents=True, exist_ok=True)
     conv = lambda o: None if isinstance(o, float) and math.isinf(o) else str(o)
@@ -100,6 +105,15 @@ def _save(root: Path, label: str, res, extra: dict) -> Path:
          "by_symbol": res.by_symbol, "notes": res.notes, **extra}, indent=2, default=conv))
     pd.DataFrame(res.trades).to_csv(out / "trades.csv", index=False)
     res.equity.rename("equity").to_csv(out / "equity.csv")
+    if ctx is not None:                      # every saved run says exactly what it was (see backtest/manifest.py)
+        m = build_manifest(label=label.split("/")[0], run_name=label, data_integrity=extra.get("data_integrity"),
+                           excluded_symbols=extra.get("excluded_symbols"), synthetic=bool(extra.get("synthetic")),
+                           measured=dict(zip(("start", "end"), (res.notes["measurement_period"]["start"],
+                                                                res.notes["measurement_period"]["end"]))), **ctx)
+        write_manifest(out, attach_outputs(m, out))
+        if m["holdout"]["exposed"]:
+            print(f"  NOTE: the measured period of {label} overlaps the confirmation period "
+                  f"({', '.join(o['period'] for o in m['holdout']['overlaps'])}); this run is recorded as a holdout exposure.")
     return out
 
 
@@ -120,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="historical: real funding rates (aborts if they cannot be fully downloaded); approx: constant scenario")
     ap.add_argument("--liq-brackets", help="JSON file of Binance maintenance-margin brackets (see liquidation.py)")
     ap.add_argument("--slippage-scale", type=float, default=1.0, help="multiply the slippage assumptions (try 2.0 as a stress test)")
+    ap.add_argument("--fee-scale", type=float, default=1.0,
+                    help="multiply the taker fee (1.2 is the protocol's +20%% fee stress)")
+    ap.add_argument("--acceptance", action="store_true",
+                    help="an ACCEPTANCE run under docs/STRATEGY_ACCEPTANCE.md: needs an approved protocol, a valid --freeze-record, "
+                         "real data, historical funding, --liq-brackets and the production risk limits. Without it a run is exploratory")
+    ap.add_argument("--freeze-record", help="the freeze record (JSON) this acceptance run must match exactly")
     ap.add_argument("--no-breaker", action="store_true", help="disable the 4%% daily drawdown breaker")
     ap.add_argument("--legacy-risk", action="store_true",
                     help="disable the aggregate-risk, same-side and gross-notional limits added later, to compare with "
@@ -162,6 +182,49 @@ def _segments(start: pd.Timestamp, end: pd.Timestamp, split: str | None, windows
     return segs
 
 
+def _data_policy(a) -> dict:
+    return {"allow_late_start": bool(a.allow_late_start), "allow_partial": bool(a.allow_partial)}
+
+
+def acceptance_preflight(a) -> list[str]:
+    """Why this invocation cannot be an acceptance run, before anything is downloaded or computed."""
+    problems = []
+    if a.synthetic:
+        problems.append("synthetic data can never be an acceptance run")
+    if a.funding != "historical":
+        problems.append("acceptance needs --funding historical")
+    if not a.liq_brackets:
+        problems.append("acceptance needs --liq-brackets (actual Binance brackets); the flat 0.5% default is exploratory only")
+    for flag, on in (("--legacy-risk", a.legacy_risk), ("--no-breaker", a.no_breaker), ("--allow-partial", a.allow_partial)):
+        if on:
+            problems.append(f"acceptance cannot use {flag}")
+    approval = fz.validate_protocol_approval()
+    problems += [f"protocol: {p}" for p in approval["problems"]]
+    if not a.freeze_record:
+        problems.append("acceptance needs --freeze-record")
+    else:
+        try:
+            record = fz.load_freeze_record(a.freeze_record)
+        except (OSError, ValueError) as exc:
+            problems.append(f"the freeze record cannot be read ({type(exc).__name__})")
+        else:
+            problems += [f"freeze record: {p}" for p in (*fz.validate_freeze_record(record), *fz.freeze_signature_problems(record))]
+            a.freeze_loaded = record
+    return problems
+
+
+def _require_eligible(a, label, strategies, cfg, frames, funding_history, measure_start, end, extra) -> None:
+    pre = build_manifest(label=label, run_name=label, strategies=strategies, cfg=cfg, frames=frames, funding=funding_history,
+                         synthetic=bool(extra.get("synthetic")), acceptance=True, freeze_record=getattr(a, "freeze_loaded", None),
+                         measured={"start": str(measure_start), "end": str(end)}, data_integrity=extra.get("data_integrity"),
+                         excluded_symbols=extra.get("excluded_symbols"), data_policy=_data_policy(a),
+                         liquidation_file_sha256=sha256_file(a.liq_brackets) if a.liq_brackets else None)
+    if not pre["eligibility"]["acceptance_eligible"]:
+        failed = [k for k, v in pre["eligibility"]["conditions"].items() if not v]
+        raise SystemExit(f"REFUSED: {label} cannot be an acceptance run. Conditions not met: {', '.join(failed)}. "
+                         + "; ".join(pre["eligibility"]["problems"]))
+
+
 def _make_cfg(a, strategies: tuple[str, ...], measure_start, measure_end, funding_history, liq) -> BacktestConfig:
     params = StrategyParams(timeframe=a.timeframe, strategies=strategies)
     if a.legacy_risk:
@@ -169,6 +232,7 @@ def _make_cfg(a, strategies: tuple[str, ...], measure_start, measure_end, fundin
     default_liq, overrides = liq
     return BacktestConfig(
         initial_capital=a.capital, leverage=a.leverage, slippage_scale=a.slippage_scale, use_breaker=not a.no_breaker,
+        taker_fee=TAKER_FEE * a.fee_scale,
         params=params, strategies=strategies, measure_start=measure_start, measure_end=measure_end,
         funding_mode=a.funding, funding_history=funding_history, liquidation=default_liq, liquidation_overrides=overrides)
 
@@ -179,17 +243,26 @@ def _run_group(a, label: str, frames: dict, measure_start, end, funding_history,
     summary_rows = []
     for strategies in combos:
         name = "+".join(strategies)
+        cfg = _make_cfg(a, strategies, measure_start, end, funding_history, liq)
+        if a.acceptance:                      # refuse BEFORE running if this run cannot be an acceptance run
+            _require_eligible(a, label, strategies, cfg, frames, funding_history, measure_start, end, extra)
         try:
-            res = Backtester(frames, _make_cfg(a, strategies, measure_start, end, funding_history, liq)).run()
+            res = Backtester(frames, cfg).run()
         except ValueError as exc:
             raise SystemExit(f"Cannot run the backtest ({label}, {name}): {exc}")
         report(f"{label} | {name}", res, a, len(frames))
-        out = _save(root, f"{label}/{name}", res, extra)
-        summary_rows.append((name, res.metrics))
         segs = _segments(res.equity.index[0], res.equity.index[-1], a.split, a.windows)
+        ctx = dict(strategies=strategies, cfg=cfg, frames=frames, funding=funding_history,
+                   argv=getattr(a, "argv_recorded", None), acceptance=a.acceptance,
+                   freeze_record=getattr(a, "freeze_loaded", None), data_policy=_data_policy(a),
+                   liquidation_file_sha256=sha256_file(a.liq_brackets) if a.liq_brackets else None,
+                   arguments={k: getattr(a, k, None) for k in ARG_CLASSIFICATION})
+        out = _save(root, f"{label}/{name}", res, extra, ctx)
+        summary_rows.append((name, res.metrics))
         for seg_name, s0, s1 in segs:
+            seg_cfg = _make_cfg(a, strategies, s0, s1, funding_history, liq)
             try:
-                seg = Backtester(frames, _make_cfg(a, strategies, s0, s1, funding_history, liq)).run()
+                seg = Backtester(frames, seg_cfg).run()
             except ValueError as exc:
                 print(f"\n  [{seg_name}] cannot be run: {exc}")
                 continue
@@ -197,7 +270,8 @@ def _run_group(a, label: str, frames: dict, measure_start, end, funding_history,
             print(f"\n  [{seg_name} {s0:%Y-%m-%d} to {s1:%Y-%m-%d}] return {seg.metrics['total_return']:+.2%}, "
                   f"max drawdown {seg.metrics['max_drawdown']:.2%}, Sharpe {seg.metrics['sharpe']:.2f}, trades {seg.metrics['trades']}, "
                   f"PF {seg.metrics['profit_factor']:.2f}{tag}")
-            _save(root, f"{label}/{name}/{seg_name}", seg, extra)
+            _save(root, f"{label}/{name}/{seg_name}", seg, extra,
+                  {**ctx, "cfg": seg_cfg, "segment": {"name": seg_name, "start": str(s0), "end": str(s1)}})
         print(f"\n  Saved to {out}/")
     if len(summary_rows) > 1:
         print(f"\n=== {label}: strategy comparison (same data, same costs, same risk limits) ===")
@@ -221,6 +295,13 @@ async def _fetch_group(a, symbols: list[str], w, funding_start_ms: int, root: Pa
 
 def main(argv: list[str] | None = None) -> None:
     a = build_parser().parse_args(argv)
+    a.argv_recorded = list(argv if argv is not None else sys.argv[1:])
+    if a.fee_scale <= 0 or not math.isfinite(a.fee_scale):
+        raise SystemExit("--fee-scale must be a positive number")
+    if a.acceptance:
+        problems = acceptance_preflight(a)
+        if problems:
+            raise SystemExit("REFUSED: this cannot be an acceptance run:\n  - " + "\n  - ".join(problems))
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     root = Path(a.out) / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     liq = load_liquidation_config(a.liq_brackets) if a.liq_brackets else (None, {})
