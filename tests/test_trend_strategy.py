@@ -121,3 +121,87 @@ def test_evaluate_symbol_both_enabled_records_reason_when_nothing_fires():
     ind = compute_indicators(trend_frame(confirm_volume=1.0), P)
     res, dec = evaluate_symbol("X", ind, len(ind) - 1, P, enabled=(BREAKOUT, TREND))
     assert res.signal is None and "breakout:" in res.reason and "trend:" in res.reason and dec == []
+
+
+# ---- approved decision B: the SIGNAL candle must close strictly beyond EMA50 (long above, short below; equality fails)
+from g_aegisbot.engine.trend import add_trend_columns  # noqa: E402
+
+
+def with_ema50(df, factor):
+    """Indicators for `df` where the signal candle's EMA50 is set to close * factor and every trend column is recomputed.
+    Only that candle's EMA50 changes, so the other clauses read exactly what they read for the unmodified frame."""
+    ind = compute_indicators(df, P).copy()
+    ind.iloc[-1, ind.columns.get_loc("ema_f")] = float(ind["close"].iloc[-1]) * factor
+    add_trend_columns(ind, P)
+    return ind
+
+
+def verdict(ind):
+    return evaluate_trend_at("X", ind, len(ind) - 1, P)
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_unmodified_setups_close_beyond_ema50_and_signal(direction):
+    res, ind = run(trend_frame(direction=direction))
+    last = ind.iloc[-1]
+    assert (last["close"] > last["ema_f"]) if direction == 1 else (last["close"] < last["ema_f"])
+    assert res.signal is not None
+
+
+def test_long_is_rejected_when_the_signal_close_is_below_ema50():
+    res = verdict(with_ema50(trend_frame(direction=1), 1.001))             # EMA50 0.1% above the close
+    assert res.signal is None and "EMA50" in res.reason
+
+
+def test_short_is_rejected_when_the_signal_close_is_above_ema50():
+    res = verdict(with_ema50(trend_frame(direction=-1), 0.999))            # EMA50 0.1% below the close
+    assert res.signal is None and "EMA50" in res.reason
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_equality_with_ema50_does_not_qualify(direction):
+    ind = with_ema50(trend_frame(direction=direction), 1.0)
+    assert ind["close"].iloc[-1] == ind["ema_f"].iloc[-1]
+    res = verdict(ind)
+    assert res.signal is None and "EMA50" in res.reason
+
+
+@pytest.mark.parametrize("direction,factor", [(1, 1 - 1e-9), (-1, 1 + 1e-9)])
+def test_the_smallest_step_beyond_ema50_qualifies(direction, factor):
+    res = verdict(with_ema50(trend_frame(direction=direction), factor))
+    assert res.signal is not None, res.reason
+
+
+def test_the_rule_is_judged_on_the_signal_candle_not_the_next_one():
+    df = trend_frame()
+    signal_ind = compute_indicators(df, P)
+    i = len(df) - 1
+    crash = candles([-0.2], start_price=float(df["close"].iloc[-1]), start=df.index[-1] + pd.Timedelta(hours=1))
+    full = compute_indicators(pd.concat([df, crash]), P)
+    assert full["close"].iloc[-1] < full["ema_f"].iloc[-1]                  # the execution candle is far below EMA50
+    assert evaluate_trend_at("X", full, i, P).signal is not None             # the signal candle is still valid
+    assert evaluate_trend_at("X", full, i + 1, P).signal is None            # and the crash candle itself is not an entry
+    assert evaluate_trend_at("X", signal_ind, i, P).signal is not None
+
+
+def test_the_other_clauses_are_unchanged_by_the_new_rule():
+    ind = compute_indicators(trend_frame(), P)
+    for clause in ("L_trend", "L_touch", "L_valid", "L_depth", "L_confirm", "L_vol", "L_ema50"):
+        assert bool(ind[clause].iloc[-1]), clause
+
+
+# ---- the existing EMA50 exit is untouched (strict: a close exactly on EMA50 does not exit)
+def test_trend_exit_still_fires_below_ema50_and_not_on_equality_for_longs():
+    base = trend_frame()
+    ind_eq = with_ema50(base, 1.0)
+    assert exit_signal(TREND, ind_eq, len(ind_eq) - 1, "buy") is None
+    ind_below = with_ema50(base, 1.001)
+    assert "close below EMA50" in exit_signal(TREND, ind_below, len(ind_below) - 1, "buy")
+
+
+def test_trend_exit_still_fires_above_ema50_and_not_on_equality_for_shorts():
+    base = trend_frame(direction=-1)
+    ind_eq = with_ema50(base, 1.0)
+    assert exit_signal(TREND, ind_eq, len(ind_eq) - 1, "sell") is None
+    ind_above = with_ema50(base, 0.999)
+    assert "close above EMA50" in exit_signal(TREND, ind_above, len(ind_above) - 1, "sell")

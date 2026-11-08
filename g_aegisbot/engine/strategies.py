@@ -9,8 +9,11 @@ Both are evaluated on the same indicator frame of CLOSED candles by the live sca
 Conflict rules (one position per symbol, never forced, never silent):
   * no strategy signals                 -> no trade; the per-strategy reasons are kept
   * strategies signal OPPOSITE sides    -> no trade for that symbol on that candle (they disagree), recorded as a conflict
-  * strategies signal the SAME side     -> one signal is kept (ranked by conviction, volume strength, then
-                                           StrategyParams.strategy_priority); the other is recorded as a duplicate
+  * strategies signal the SAME side     -> one signal is kept, chosen by strategy.signal_rank_key: STRICT strategy priority
+                                           (StrategyParams.strategy_priority, default breakout then trend) first, then
+                                           conviction, then volume ratio; the other is recorded as a duplicate
+Strict priority applies to competing signals only. It never allows a second position on a symbol, and it never overrides
+the opposite-sides rule above.
 Every decision is returned as a SignalDecision so it can be logged and counted.
 """
 from __future__ import annotations
@@ -30,6 +33,7 @@ TREND = "trend"
 ALL_STRATEGIES = (BREAKOUT, TREND)
 
 _CLAUSE_REASON = {
+    "ema50": "signal candle did not close beyond EMA50 (long needs close above, short needs close below; equality fails)",
     "touch": "no pullback into EMA20 in the last 8 candles",
     "valid": "pullback broke the trend (close below EMA50 or low below EMA200)",
     "depth": "pullback too shallow (under 1 ATR)",

@@ -108,7 +108,7 @@ class TradingRunner:
             self.lock.acquire()                    # first: a second runner must refuse before it touches anything
         if self.market is None:
             self.market = BinanceFuturesAdapter(testnet=False)   # public data only, no keys
-        self.scanner = MultiPairScanner(self.market, symbols=(), params=self.params)
+        self.scanner = MultiPairScanner(self.market, symbols=(), params=self.params, clock=self.clock)
 
     async def shutdown(self) -> None:
         try:
@@ -298,7 +298,7 @@ class TradingRunner:
             if dropped:
                 log.warning("Binance does not list these symbols, they are ignored: %s", dropped)
         results = await self.scanner.scan()
-        signals = rank_signals(results)
+        signals = rank_signals(results, self.params.strategy_priority)
         for d in self.scanner.decisions:
             if not d.kept:
                 log.info("signal not used: %s %s [%s] %s", d.symbol, d.side, d.strategy, d.reason)

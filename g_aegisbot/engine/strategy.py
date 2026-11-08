@@ -6,6 +6,10 @@ Rules (all evaluated on the last CLOSED candle):
   3. RSI band: long 50-70, short 30-50 (momentum without being stretched).
   4. Volume: candle volume >= 1.5 x the 20-candle volume average (prior 20 candles).
   5. Stop: entry -/+ 2 x ATR, trailed with a ratchet that only moves in the trade's favour.
+
+This module also holds what every strategy shares: the indicator frame, sizing and portfolio limits (`compute_size`), the
+trailing stop, and the one ranking of competing signals (`signal_rank_key`: strict strategy priority first, then conviction,
+then volume ratio). The second strategy (trend pullback) lives in engine/strategies.py and engine/trend.py.
 """
 from __future__ import annotations
 
@@ -623,17 +627,21 @@ async def execute_plan(adapter, plan: TradePlan, *, sleep=asyncio.sleep, before_
             "client_order_id": client_id, "partial": filled < plan.amount * 0.999, "outstanding": outstanding}
 
 
-def rank_signals(results: list[ScanResult]) -> list[Signal]:
-    """Signals only, best first (high conviction, then strongest volume)."""
+def rank_signals(results: list[ScanResult], priority: tuple[str, ...]) -> list[Signal]:
+    """Signals only, best first, in the order of `signal_rank_key`. The priority is required, never defaulted, so no
+    caller can rank without saying which strategy comes first."""
     sigs = [r.signal for r in results if r.signal]
-    return sorted(sigs, key=signal_rank_key)
+    return sorted(sigs, key=lambda s: signal_rank_key(s, priority))
 
 
-def signal_rank_key(s: Signal, priority: tuple[str, ...] = ("breakout", "trend")) -> tuple:
-    """Total order, so two runs over the same data always pick the same signals in the same sequence:
-    high conviction first, then volume strength, then strategy priority, then symbol name."""
-    pri = priority.index(s.strategy) if s.strategy in priority else len(priority)
-    return (s.conviction != "high", -round(s.volume_ratio, 9), pri, s.symbol, s.side)
+def signal_rank_key(s: Signal, priority: tuple[str, ...]) -> tuple:
+    """THE ranking of competing signals, used by the per-symbol choice, the live scanner, the live runner and the
+    backtester. Strict strategy priority comes first: every signal of a strategy listed earlier in `priority` outranks
+    every signal of a later one, whatever its conviction or volume. Within one strategy, high conviction comes first,
+    then the larger volume ratio. A strategy missing from `priority` ranks after all listed ones, and ties end on symbol,
+    side and strategy name, so two runs over the same data always pick the same signals in the same sequence."""
+    rank = priority.index(s.strategy) if s.strategy in priority else len(priority)
+    return (rank, s.conviction != "high", -round(s.volume_ratio, 9), s.symbol, s.side, s.strategy)
 
 
 # --------------------------------------------------------------------------- scanner
@@ -644,6 +652,7 @@ class MultiPairScanner:
     params: StrategyParams = field(default_factory=StrategyParams)
     indicators: dict = field(default_factory=dict)   # symbol -> indicator frame of CLOSED candles, refreshed each scan
     decisions: list = field(default_factory=list)    # SignalDecision records of the latest scan (kept, duplicate, conflict)
+    clock: object = lambda: datetime.now(timezone.utc)   # "now"; a candle is closed only once its time has passed
 
     async def prepare(self) -> list[str]:
         """Load markets and drop symbols Binance does not list. Returns the dropped symbols."""
@@ -658,7 +667,17 @@ class MultiPairScanner:
         try:
             async with sem:
                 df = await self.adapter.fetch_ohlcv_df(symbol, self.params.timeframe, self.params.candles + 1)
-            closed = df.iloc[:-1]  # drop the still-forming candle
+            # A candle is closed because its time is over, not because it is not the last row: the exchange may or may not have
+            # listed the new forming candle yet. Anything not yet over is dropped, and if the newest closed candle is not the
+            # one that just ended, the data is stale and nothing is evaluated (a signal on an old bar would be traded now).
+            tf = pd.Timedelta(seconds=ccxt.Exchange.parse_timeframe(self.params.timeframe))
+            now = pd.Timestamp(self.clock())
+            now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+            closed = df[df.index + tf <= now]
+            latest = now.floor(tf) - tf
+            if closed.empty or closed.index[-1] != latest:
+                seen = closed.index[-1] if len(closed) else "none"
+                return _reject(symbol, f"stale candle data (newest closed candle {seen}, expected {latest})")
             if len(closed) < self.params.min_candles:
                 return _reject(symbol, f"not enough candles ({len(closed)}<{self.params.min_candles})")
             ind = compute_indicators(closed, self.params)
@@ -677,5 +696,5 @@ class MultiPairScanner:
         return list(await asyncio.gather(*(self._scan_one(sem, s) for s in self.symbols)))
 
     async def scan_signals(self) -> list[Signal]:
-        """Signals only, best first (high conviction, then strongest volume)."""
-        return rank_signals(await self.scan())
+        """Signals only, best first by the configured strategy priority, then conviction, then volume."""
+        return rank_signals(await self.scan(), self.params.strategy_priority)

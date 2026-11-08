@@ -272,3 +272,89 @@ async def test_uncertain_order_stores_nothing_marks_unverified_and_does_not_retr
     assert "alice" in r._unverified or calls == [SYM]       # either flagged, or re-verified clean straight away
     await r.run_cycle()
     assert calls.count(SYM) <= 2
+
+
+# ---- approved decisions: strict strategy priority in the live runner, and the trend trailing multiple across a restart
+TWO = ["BRK/USDT:USDT", "TRD/USDT:USDT"]
+
+
+def two_strategy_world(world):
+    """BRK holds a breakout (ratio 1.6), TRD a valid trend pullback entry on 4x volume: by volume alone TRD would win."""
+    from tests.trendfx import trend_frame
+    brk = with_breakout(make(), vol=160.0)                                    # 400 closed candles
+    trd = trend_frame(n_trend=394, confirm_volume=400.0)                       # 400 closed candles, same clock
+    assert list(brk.index) == list(trd.index)
+    market = FakeMarket(TWO)
+    for sym, frame in zip(TWO, (brk, trd)):
+        market.candles[(sym, "1h")] = hourly_with_forming(frame)
+        market.prices[sym] = float(frame["close"].iloc[-1])
+    with world["sf"]() as s:
+        s.scalar(select(UserProfile)).active_coins = TWO
+        s.commit()
+    return market
+
+
+@pytest.mark.parametrize("priority,expected", [(("breakout", "trend"), ("BRK/USDT:USDT", "breakout")),
+                                               (("trend", "breakout"), ("TRD/USDT:USDT", "trend"))])
+async def test_runner_takes_the_slot_for_the_higher_priority_strategy(world, priority, expected):
+    market = two_strategy_world(world)
+    params = StrategyParams(strategies=("breakout", "trend"), strategy_priority=priority, max_open_positions=1)
+    r = TradingRunner(world["sf"], world["box"], params, market=market, clock=world["clock"])
+    await r.start()
+    await r.run_cycle()
+    assert [(p.symbol, p.strategy) for p in positions(world["sf"])] == [expected]
+    assert [(t.symbol, t.strategy) for t in open_trades(world["sf"])] == [expected]
+
+
+async def test_trend_trailing_multiple_is_stored_and_still_used_after_a_restart(world):
+    from g_aegisbot.engine.strategy import compute_indicators
+    from tests.trendfx import trend_frame
+    sf, clock, market = world["sf"], world["clock"], world["market"]
+    frame = trend_frame(n_trend=394)
+    market.candles[(SYM, "1h")] = hourly_with_forming(frame)
+    market.prices[SYM] = float(frame["close"].iloc[-1])
+    clock.now = frame.index[-1].to_pydatetime() + timedelta(hours=1, seconds=5)
+    params = StrategyParams(strategies=("trend",))
+
+    first = TradingRunner(sf, world["box"], params, market=market, clock=clock)
+    await first.start()
+    await first.run_cycle()
+    trade = open_trades(sf)[0]
+    assert trade.strategy == "trend" and trade.trail_atr_mult == params.trend_trail_atr_mult == 3.0
+
+    restarted = TradingRunner(sf, world["box"], params, market=market, clock=clock)         # a new process, same database
+    await restarted.start()
+    assert open_trades(sf)[0].trail_atr_mult == 3.0
+    last = float(frame["close"].iloc[-1])
+    ts = frame.index[-1] + pd.Timedelta(hours=1)
+    bar = pd.DataFrame({"open": [last], "high": [last * 1.06], "low": [last * 0.999], "close": [last * 1.05],
+                        "volume": [100.0]}, index=[ts])
+    grown = pd.concat([frame, bar])
+    market.candles[(SYM, "1h")] = hourly_with_forming(grown)
+    market.prices[SYM] = last * 1.05
+    clock.now = ts.to_pydatetime() + timedelta(hours=1, seconds=5)
+    await restarted.run_cycle()
+
+    atr = float(compute_indicators(grown, params)["atr"].iloc[-1])
+    trade = open_trades(sf)[0]
+    assert trade.extreme_price == pytest.approx(last * 1.06)
+    assert trade.stop_price == pytest.approx(last * 1.06 - 3.0 * atr)                   # the 3 ATR trend trail, not 2 ATR
+    assert trade.stop_price != pytest.approx(last * 1.06 - 2.0 * atr)
+    assert positions(sf)[0].stop_price == pytest.approx(trade.stop_price)
+
+
+async def test_runner_still_trades_the_just_closed_candle_when_the_exchange_has_not_listed_the_next_one(world):
+    world["market"].candles[(SYM, "1h")] = world["closed"]                  # no forming row in the feed
+    r = world["runner"]
+    await r.start()
+    await r.run_cycle()
+    assert len(positions(world["sf"])) == 1
+
+
+async def test_runner_does_not_trade_on_stale_candles(world, caplog):
+    world["clock"].now += timedelta(hours=3)                                # two candles never arrived
+    r = world["runner"]
+    await r.start()
+    with caplog.at_level(logging.INFO):
+        await r.run_cycle()
+    assert positions(world["sf"]) == [] and "stale candle data" in caplog.text

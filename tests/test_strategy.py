@@ -263,7 +263,8 @@ async def test_scanner_isolates_errors_drops_forming_candle_and_ranks():
     forming.loc[forming.index[-1] + pd.Timedelta(hours=1)] = forming.iloc[-1]
     frames = {"A/USDT:USDT": forming, "B/USDT:USDT": RuntimeError("net"), "C/USDT:USDT": make(),
               "D/USDT:USDT": make()}
-    sc = MultiPairScanner(ScanAdapter(frames, bad=["D/USDT:USDT"]), symbols=list(frames))
+    now = (good.index[-1] + pd.Timedelta(hours=1, seconds=5)).to_pydatetime()      # just after the signal candle closed
+    sc = MultiPairScanner(ScanAdapter(frames, bad=["D/USDT:USDT"]), symbols=list(frames), clock=lambda: now)
     assert await sc.prepare() == ["D/USDT:USDT"]
     res = {r.symbol: r for r in await sc.scan()}
     assert res["A/USDT:USDT"].signal is not None

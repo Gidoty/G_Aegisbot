@@ -6,12 +6,16 @@ backtester read these same columns, so the rules cannot drift apart. The rules a
 
 Long, evaluated on the close of candle i (short is the exact mirror):
   trend      EMA50 > EMA200, close > EMA200, and EMA50 higher than it was 24 candles ago
+  ema50      the signal candle closes STRICTLY above EMA50 (a close equal to EMA50 fails). Judged on the signal candle itself
+             (candle i), never on the execution candle after it
   touch      within candles i-8..i-1 at least one low reached EMA20 (a real pullback into the zone)
   valid      within candles i-8..i-1 no close was below EMA50 and no low was below EMA200 (trend intact)
   depth      the 20-candle high minus the pullback low is at least 1 ATR (touching an average is not enough)
   confirm    close > open, close > EMA20, close > the previous high, and RSI > 50 (momentum resumed)
   volume     volume >= 1.0 x the average of the prior 20 candles
 Exit rule, besides the ATR stop: close back below EMA50 (long) or above EMA50 (short), the trend structure is lost.
+The entry needs a close strictly on the trend side of EMA50 and the exit fires strictly on the other side, so a close exactly on
+EMA50 neither enters nor exits.
 """
 from __future__ import annotations
 
@@ -19,8 +23,8 @@ import pandas as pd
 
 from g_aegisbot.engine.indicators import ema
 
-LONG_CLAUSES = ("L_trend", "L_touch", "L_valid", "L_depth", "L_confirm", "L_vol")
-SHORT_CLAUSES = ("S_trend", "S_touch", "S_valid", "S_depth", "S_confirm", "S_vol")
+LONG_CLAUSES = ("L_trend", "L_ema50", "L_touch", "L_valid", "L_depth", "L_confirm", "L_vol")
+SHORT_CLAUSES = ("S_trend", "S_ema50", "S_touch", "S_valid", "S_depth", "S_confirm", "S_vol")
 
 
 def add_trend_columns(out: pd.DataFrame, p) -> None:
@@ -41,6 +45,7 @@ def add_trend_columns(out: pd.DataFrame, p) -> None:
     vol_ok = out["volume"] >= p.trend_vol_mult * out["vol_ma"]
 
     out["L_trend"] = (out["ema_f"] > out["ema_s"]) & (c > out["ema_s"]) & (out["ema_f_slope"] > 0)
+    out["L_ema50"] = c > out["ema_f"]                       # strict: equality with EMA50 does not qualify
     out["L_touch"] = window_any(l <= out["ema_p"])
     out["L_valid"] = ~window_any(c < out["ema_f"]) & ~window_any(l < out["ema_s"])
     out["L_depth"] = (swing_high - win_low) >= p.min_pullback_atr * out["atr"]
@@ -48,6 +53,7 @@ def add_trend_columns(out: pd.DataFrame, p) -> None:
     out["L_vol"] = vol_ok
 
     out["S_trend"] = (out["ema_f"] < out["ema_s"]) & (c < out["ema_s"]) & (out["ema_f_slope"] < 0)
+    out["S_ema50"] = c < out["ema_f"]                       # strict: equality with EMA50 does not qualify
     out["S_touch"] = window_any(h >= out["ema_p"])
     out["S_valid"] = ~window_any(c > out["ema_f"]) & ~window_any(h > out["ema_s"])
     out["S_depth"] = (win_high - swing_low) >= p.min_pullback_atr * out["atr"]
