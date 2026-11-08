@@ -42,6 +42,12 @@ python -m g_aegisbot.backtest --synthetic --years 1   # pipeline check only; the
 `brackets.json` holds Binance's maintenance-margin tiers per symbol (see `g_aegisbot/backtest/liquidation.py`). Without
 it a flat 0.5% maintenance rate is used and the report states that.
 
+## What changed since the baseline below (so old and new numbers are not mixed up)
+Strict strategy priority, the EMA50 trend entry filter, time-based closed-candle handling and the entry price guard
+(`max_entry_chase_atr`, entries skipped when the open ran away from the signal close) all alter results. Any run made before
+those changes is not comparable with a run made after them. Combined runs now also report per-strategy equity, drawdown,
+Sharpe and sortino in `by_strategy` (`summary.json`); the strategies' attributed equity adds up exactly to the portfolio.
+
 ## What each run writes
 `summary.json` (metrics, per-symbol, per-strategy, per-exit-reason, assumptions), `trades.csv`, `equity.csv`, and `manifest.json`
 (code hash, library versions, full parameters and configuration, per-symbol data and funding hashes, the acceptance-protocol

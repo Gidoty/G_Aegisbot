@@ -9,8 +9,12 @@ Bar-by-bar order (matches live timing):
   1. historical funding that settles inside this bar is charged to positions carried into it (funding_mode="historical")
   2. strategy exits decided at the previous close fill at this bar's OPEN (+ slippage, taker fee)
   3. entries decided at the previous close fill at this bar's OPEN (+ slippage, taker fee)
-  4. stops are tested against this bar's range; a gap through the stop fills at the open; liquidation is checked on the same
-     bar and wins if the adverse move reaches it first
+  4. stops are tested against this bar's range; a gap through the stop fills at the open. Liquidation is only reached when a
+     gap carries the fill through the stop AND past the liquidation price (the sizing rules keep the stop well inside the
+     liquidation distance, so a normal move triggers the stop first); a fast crash whose stop fills far below its price is
+     not modelled
+  3a. an entry is skipped if the open is already at or through the stop, or has run more than max_entry_chase_atr ATR beyond
+     the signal close (the same rule as the live planner, counted as "entry price ran away")
   5. (funding_mode="approx") constant funding accrues, then trailing stops are updated from this bar (effective next bar)
   6. equity is marked at the close and the daily drawdown breaker is evaluated
   7. new signals and strategy exits are evaluated on this bar's close (signals skipped while the breaker is tripped)
@@ -43,7 +47,7 @@ import pandas as pd
 
 from g_aegisbot.backtest.funding import FundingSchedule
 from g_aegisbot.backtest.liquidation import LiquidationModel
-from g_aegisbot.backtest.metrics import breakdown, compute_metrics
+from g_aegisbot.backtest.metrics import breakdown, compute_metrics, max_drawdown, sharpe_ratio, sortino_ratio
 from g_aegisbot.config import DAILY_DRAWDOWN_LIMIT, DEFAULT_LEVERAGE
 from g_aegisbot.costs import FUNDING_RATE_8H, MAKER_FEE, TAKER_FEE, slippage_rate
 from g_aegisbot.engine import risk
@@ -218,6 +222,8 @@ class Backtester:
         pending: list[tuple] = []               # (signal, plan), filled at the next bar's open
         trades: list[dict] = []
         eq_t, eq_v = [self.measure_start], [cfg.initial_capital]
+        realized = {sid: 0.0 for sid in self.strategies}              # net PnL of each strategy's closed trades
+        strat_v = {sid: [cfg.initial_capital] for sid in self.strategies}    # each strategy's attributed equity per measured bar
         last_close: dict[str, float] = {}
         tracker, tripped_days, skips = None, set(), Counter()
         sig_stats: dict[str, Counter] = {sid: Counter() for sid in self.strategies}
@@ -245,6 +251,7 @@ class Backtester:
                 "initial_stop": pos.initial_stop, "stop_at_exit": pos.trail.stop_price,
                 "holding_hours": (when - pos.opened_at).total_seconds() / 3600,
             })
+            realized[pos.strategy] += trades[-1]["pnl"]
             del positions[pos.symbol]
 
         for k in range(n):
@@ -344,6 +351,10 @@ class Backtester:
             if measuring:
                 eq_t.append(t_close)
                 eq_v.append(equity)
+                for sid in self.strategies:               # realised net PnL + open PnL after the position's own fee and funding
+                    strat_v[sid].append(cfg.initial_capital + realized[sid] + sum(
+                        (last_close[s] - q.entry) * q.amount * q.dir - q.fee_in - q.funding
+                        for s, q in positions.items() if q.strategy == sid))
             tripped = False
             if cfg.use_breaker and measuring:
                 tracker, event = risk.update_tracker(tracker, equity, t_close.to_pydatetime(), cfg.drawdown_limit)
@@ -372,9 +383,6 @@ class Backtester:
                         sig_stats[d.strategy]["kept" if d.kept else "dropped"] += 1
                         if not d.kept:
                             decision_reasons[d.reason.split(" (")[0].split(" as ")[0]] += 1
-                    if not decisions and result.signal:
-                        sig_stats[result.signal.strategy]["generated"] += 1
-                        sig_stats[result.signal.strategy]["kept"] += 1
             signals = sorted((r.signal for r in results if r.signal), key=lambda x: signal_rank_key(x, p.strategy_priority))
             for sig in signals:
                 cap = cfg.wallet_cap if cfg.wallet_cap is not None else float("inf")
@@ -397,6 +405,8 @@ class Backtester:
         for s, pos in list(positions.items()):
             close(pos, self._fill(s, last_close[s], pos.dir == -1), self.timeline[-1] + self.tf, EXIT_END, "end of measured data")
         eq_v[-1] = wallet
+        for sid in self.strategies:
+            strat_v[sid][-1] = cfg.initial_capital + realized[sid]
         equity_s = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t)).groupby(level=0).last()
 
         start, end = equity_s.index[0], equity_s.index[-1]
@@ -405,6 +415,12 @@ class Backtester:
         for s in self.ind:
             by_symbol.setdefault(s, {"trades": 0, "net_pnl": 0.0, "win_rate": 0.0})
         by_strategy = breakdown(trades, "strategy")
+        for sid in self.strategies:
+            curve = pd.Series(strat_v[sid], index=pd.DatetimeIndex(eq_t)).groupby(level=0).last()
+            row = by_strategy.setdefault(sid, {"trades": 0, "net_pnl": 0.0, "win_rate": 0.0})
+            row.update({"final_equity_attributed": float(curve.iloc[-1]),
+                        "equity_return": float(curve.iloc[-1] / cfg.initial_capital - 1.0),
+                        "max_drawdown": max_drawdown(curve), "sharpe": sharpe_ratio(curve), "sortino": sortino_ratio(curve)})
         by_exit = breakdown(trades, "reason")
         first_eligible = {}
         for s, i in self.ind.items():
