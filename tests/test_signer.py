@@ -201,3 +201,68 @@ def test_no_private_key_exists_in_the_repository_tree():
     # tests create keys only in temporary directories; the repository must never hold a private key
     root = mf.REPO_ROOT
     assert [p for d in ("g_aegisbot", "docs", "tests") for p in (root / d).rglob("*.pem")] == []
+
+
+# ------------------------------------------------------------------------------------------------ live authorisation
+def live_unsigned(tmp_path, repo, key):
+    from dataclasses import replace  # noqa: F401
+    from datetime import datetime, timezone
+    from g_aegisbot.engine import livegate as lg
+    from g_aegisbot.engine.strategy import StrategyParams
+    pin(repo, key)
+    sha = mf.sha256_file(repo / mf.PROTOCOL_DOC)
+    (repo / fz.APPROVAL_DOC).write_text(json.dumps(signer.make_signed_approval(key, repo_root=repo, approved_by="o", version="v", confirm=sha[:8])))
+    rec = lg.build_payload(params=StrategyParams(), drawdown_limit=0.04, candidate="CAND-1", version="v1", authorised_by="owner",
+                           authorised_at=datetime.now(timezone.utc).replace(microsecond=0), valid_days=30, freeze_sha256="a" * 64,
+                           acceptance_report_sha256="b" * 64, paper_soak_days=30, max_wallet_cap_usdt=200.0, max_leverage=3,
+                           protocol_sha256=sha, code_sha256="c" * 64)
+    path = tmp_path / "live_unsigned.json"
+    path.write_text(json.dumps(rec))
+    return path
+
+
+def test_a_confirmed_live_authorisation_verifies_for_its_own_purpose_only(tmp_path, repo, keyfile):
+    key = signer.load_key(keyfile, PASS, repo_root=repo)
+    path = live_unsigned(tmp_path, repo, key)
+    signed = signer.make_signed_live_authorization(key, path, confirm="CAND-1")
+    trusted = fz.trusted_keys_for_repo(repo)
+    assert sg.verify_record(signed, sg.PURPOSE_LIVE, trusted) == []
+    assert sg.verify_record(signed, sg.PURPOSE_APPROVAL, trusted) and sg.verify_record(signed, sg.PURPOSE_FREEZE, trusted)
+
+
+@pytest.mark.parametrize("confirm", ["", "cand-1", "yes", "CAND-2"])
+def test_a_wrong_candidate_confirmation_signs_no_live_authorisation(tmp_path, repo, keyfile, confirm):
+    key = signer.load_key(keyfile, PASS, repo_root=repo)
+    with pytest.raises(signer.SignerError, match="confirmation"):
+        signer.make_signed_live_authorization(key, live_unsigned(tmp_path, repo, key), confirm=confirm)
+
+
+def test_an_invalid_or_already_signed_live_authorisation_is_not_signed(tmp_path, repo, keyfile):
+    key = signer.load_key(keyfile, PASS, repo_root=repo)
+    path = live_unsigned(tmp_path, repo, key)
+    rec = json.loads(path.read_text())
+    rec["paper_soak_days"] = 3
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(rec))
+    with pytest.raises(signer.SignerError, match="not valid"):
+        signer.make_signed_live_authorization(key, bad, confirm="CAND-1")
+    signed = tmp_path / "signed.json"
+    signed.write_text(json.dumps(signer.make_signed_live_authorization(key, path, confirm="CAND-1")))
+    with pytest.raises(signer.SignerError, match="already signed"):
+        signer.make_signed_live_authorization(key, signed, confirm="CAND-1")
+    (tmp_path / "list.json").write_text("[]")
+    with pytest.raises(signer.SignerError):
+        signer.make_signed_live_authorization(key, tmp_path / "list.json", confirm="x")
+
+
+@pytest.mark.real_gate
+def test_a_signed_live_authorisation_passes_the_gate_with_matching_code_and_params(tmp_path, repo, keyfile):
+    from g_aegisbot.engine import livegate as lg
+    from g_aegisbot.engine.strategy import StrategyParams
+    key = signer.load_key(keyfile, PASS, repo_root=repo)
+    signed = signer.make_signed_live_authorization(key, live_unsigned(tmp_path, repo, key), confirm="CAND-1")
+    (repo / lg.LIVE_AUTH_DOC).write_text(json.dumps(signed))
+    res = lg.evaluate(params=StrategyParams(), repo_root=repo, env={lg.LIVE_ENV: "1"}, code_identity=lambda: ("c" * 64, True),
+                      check_switch=True)
+    assert res.allowed, res.problems
+    assert "G3 record" in res.checks and "stub" not in res.checks      # the real gate ran

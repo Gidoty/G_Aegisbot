@@ -26,7 +26,7 @@ from g_aegisbot import audit
 from g_aegisbot.config import DAILY_DRAWDOWN_LIMIT
 from g_aegisbot.db.models import UserProfile
 from g_aegisbot.db.trading_models import EquitySnapshot, Heartbeat
-from g_aegisbot.engine import risk
+from g_aegisbot.engine import livegate, risk
 from g_aegisbot.engine.controls import ControlState, ControlStore
 from g_aegisbot.engine import strategies as strat
 from g_aegisbot.engine.paper import PaperExchange
@@ -76,8 +76,10 @@ class TradingRunner:
     def __init__(self, session_factory, box, params: StrategyParams = StrategyParams(), *, market=None,
                  dry_run: bool = False, settle_seconds: int = 5, risk_interval: int = 60,
                  drawdown_limit: float = DAILY_DRAWDOWN_LIMIT, adopt_unmanaged: bool = True, clock=_utcnow,
-                 sleep=asyncio.sleep, evidence_margin_seconds: int = 60, lock: RunnerLock | None = None):
+                 sleep=asyncio.sleep, evidence_margin_seconds: int = 60, lock: RunnerLock | None = None,
+                 live_gate=None):
         self.sf, self.box, self.params = session_factory, box, params
+        self.live_gate = live_gate                 # None: engine/livegate.evaluate (looked up at call time). A parameter for tests only
         self.market, self.dry_run = market, dry_run
         self.settle_seconds, self.risk_interval = settle_seconds, risk_interval
         self.limit, self.clock = drawdown_limit, clock
@@ -188,6 +190,15 @@ class TradingRunner:
                 self._mark_unverified(uid, f"the exchange cannot be reached with this account's credentials "
                                            f"({type(exc).__name__}); its open positions and protective stops cannot be verified")
         return None
+
+    def _live_gate_problem(self, profile: UserProfile) -> str | None:
+        """Why the live-trading gate refuses a NEW live entry for this profile, or None. Any error is a refusal."""
+        try:
+            res = (self.live_gate or livegate.evaluate)(params=self.params, drawdown_limit=self.limit, profile=profile,
+                                 lock_held=self.lock is not None, now=self.clock())
+            return None if res.allowed else "; ".join(res.problems) or "the live gate refused without a reason"
+        except Exception as exc:
+            return f"the live gate failed safely ({type(exc).__name__})"
 
     def _entry_keys_problem(self, uid: str) -> str | None:
         """Why a NEW live entry is not allowed for this user right now (API-key verification missing, stale, future-dated
@@ -343,6 +354,10 @@ class TradingRunner:
                     log.critical("[%s] NEW LIVE ENTRIES BLOCKED: %s. Existing positions keep being managed. Verify the keys "
                                  "again (set-keys --verify) to allow new entries.", profile.user_id, why)
                     return
+                if profile.trading_mode == "live" and (why := await asyncio.to_thread(self._live_gate_problem, profile)):
+                    log.critical("[%s] NEW LIVE ENTRIES BLOCKED BY THE LIVE GATE: %s. Existing positions keep being managed.",
+                                 profile.user_id, why)
+                    return
                 for sig in signals:
                     blocked = self._entries_blocked(profile.user_id)
                     if blocked:
@@ -437,6 +452,9 @@ class TradingRunner:
         if profile.trading_mode == "live" and (why := await asyncio.to_thread(self._entry_keys_problem, uid)):
             # the last check before anything can be sent; it does not depend on the profile row loaded earlier or on any cache
             log.critical("[%s] live entry %s %s REFUSED: %s", uid, sig.symbol, sig.side, why)
+            return False
+        if profile.trading_mode == "live" and (why := await asyncio.to_thread(self._live_gate_problem, profile)):
+            log.critical("[%s] live entry %s %s REFUSED BY THE LIVE GATE: %s", uid, sig.symbol, sig.side, why)
             return False
         open_trades = await asyncio.to_thread(self.store.list_open, uid)
         plan = await plan_trade(profile, adapter, sig, self.params, trades=open_trades)
@@ -1092,9 +1110,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(4)
     try:
         ensure_schema(get_engine())
-        import os
-        wanted = tuple(x.strip() for x in os.environ.get("AEGIS_STRATEGIES", "breakout").split(",") if x.strip())
-        params = StrategyParams(strategies=strat.validate_strategies(wanted))     # unknown names stop the start-up
+        params = livegate.configured_params()          # AEGIS_STRATEGIES; unknown names stop the start-up
         log.info("Strategies enabled: %s (single-runner lock: %s)", ", ".join(params.strategies), lock.mode)
         runner = TradingRunner(get_session_factory(), SecretBox.from_env(), params, dry_run=args.dry_run, lock=lock)
 

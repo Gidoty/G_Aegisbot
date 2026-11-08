@@ -5,7 +5,10 @@ session, never inside the repository.
     python -m g_aegisbot.backtest.signer pubentry --key ~/aegis-keys/approver.pem
     python -m g_aegisbot.backtest.signer sign-approval --key KEY --approved-by NAME --version v1.0
     python -m g_aegisbot.backtest.signer sign-freeze --key KEY --in unsigned_freeze.json --out freeze.json
-    python -m g_aegisbot.backtest.signer verify --purpose approval|freeze --in FILE
+    python -m g_aegisbot.backtest.signer live-template --candidate ID --version V --authorised-by NAME --valid-days N \\
+        --freeze-sha256 H --report-sha256 H --paper-soak-days N --max-cap USDT --max-leverage N > live_unsigned.json
+    python -m g_aegisbot.backtest.signer sign-live --key KEY --in live_unsigned.json [--replace]
+    python -m g_aegisbot.backtest.signer verify --purpose approval|freeze|live_authorization --in FILE
 
 Custody rules enforced here:
   * the private key is stored only as a passphrase-encrypted PKCS#8 PEM; the passphrase is typed at a prompt, never taken
@@ -124,6 +127,20 @@ def make_signed_freeze(key: Ed25519PrivateKey, unsigned_path: str | Path) -> dic
     return sg.sign_record(record, key, sg.PURPOSE_FREEZE)
 
 
+def make_signed_live_authorization(key: Ed25519PrivateKey, unsigned_path: str | Path, *, confirm: str) -> dict:
+    """Sign a live authorisation. The record is checked for shape first, and the owner must type the candidate id back."""
+    from g_aegisbot.engine import livegate as lg
+    rec = safeio.read_json(unsigned_path, fz.MAX_RECORD_BYTES)
+    if isinstance(rec, dict) and "signature" in rec:
+        raise SignerError("the record is already signed")
+    shape = lg.record_shape_problems({**rec, "signature": {}} if isinstance(rec, dict) else rec)
+    if shape:
+        raise SignerError("the live authorisation is not valid, nothing was signed: " + "; ".join(shape))
+    if confirm.strip() != rec["candidate"]:
+        raise SignerError("confirmation does not match the candidate id; nothing was signed")
+    return sg.sign_record(rec, key, sg.PURPOSE_LIVE)
+
+
 def _prompt_new_passphrase() -> str:
     first = getpass.getpass("New key passphrase (at least 12 characters): ")
     if first != getpass.getpass("Repeat the passphrase: "):
@@ -143,6 +160,13 @@ def main(argv: list[str] | None = None, *, repo_root: Path = mf.REPO_ROOT) -> in
     f = sub.add_parser("sign-freeze"); f.add_argument("--key", required=True); f.add_argument("--in", dest="inp", required=True)
     f.add_argument("--out", required=True)
     v = sub.add_parser("verify"); v.add_argument("--purpose", required=True, choices=sg.PURPOSES); v.add_argument("--in", dest="inp", required=True)
+    t = sub.add_parser("live-template")
+    for name in ("candidate", "version", "authorised-by", "freeze-sha256", "report-sha256"):
+        t.add_argument(f"--{name}", required=True)
+    t.add_argument("--valid-days", type=int, required=True); t.add_argument("--paper-soak-days", type=int, required=True)
+    t.add_argument("--max-cap", type=float, required=True); t.add_argument("--max-leverage", type=int, required=True)
+    sl = sub.add_parser("sign-live"); sl.add_argument("--key", required=True); sl.add_argument("--in", dest="inp", required=True)
+    sl.add_argument("--replace", action="store_true", help="replace an existing authorisation (renewal)")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "keygen":
@@ -168,6 +192,32 @@ def main(argv: list[str] | None = None, *, repo_root: Path = mf.REPO_ROOT) -> in
             record = make_signed_freeze(key, args.inp)
             out = safeio.write_atomic(args.out, json.dumps(record, indent=2, sort_keys=True) + "\n")
             print(f"Signed freeze record written to {out}")
+        elif args.cmd == "live-template":
+            from g_aegisbot.engine import livegate as lg
+            sha, committed = lg.live_code_identity(Path(repo_root))
+            if not committed:
+                raise SignerError("the code in this checkout is not exactly a committed version; commit it first")
+            approval = fz.validate_protocol_approval(Path(repo_root))
+            if not approval["approved"]:
+                raise SignerError("the protocol is not approved: " + "; ".join(approval["problems"]))
+            params = lg.configured_params()
+            print(json.dumps(lg.build_payload(
+                params=params, drawdown_limit=lg.DAILY_DRAWDOWN_LIMIT, candidate=args.candidate, version=args.version,
+                authorised_by=args.authorised_by, authorised_at=datetime.now(timezone.utc).replace(microsecond=0),
+                valid_days=args.valid_days, freeze_sha256=args.freeze_sha256, acceptance_report_sha256=args.report_sha256,
+                paper_soak_days=args.paper_soak_days, max_wallet_cap_usdt=args.max_cap, max_leverage=args.max_leverage,
+                protocol_sha256=approval["protocol_sha256"], code_sha256=sha), indent=2))
+        elif args.cmd == "sign-live":
+            from g_aegisbot.engine import livegate as lg
+            key = load_key(args.key, getpass.getpass("Key passphrase: "), repo_root=repo_root)
+            rec = safeio.read_json(args.inp, fz.MAX_RECORD_BYTES)
+            print("You are authorising REAL-MONEY trading:\n" + json.dumps(rec, indent=2))
+            confirm = input(f"Type the candidate id ({rec.get('candidate')}) to sign: ")
+            record = make_signed_live_authorization(key, args.inp, confirm=confirm)
+            out = safeio.write_atomic(Path(repo_root) / lg.LIVE_AUTH_DOC, json.dumps(record, indent=2, sort_keys=True) + "\n",
+                                      overwrite=args.replace)
+            print(f"Signed live authorisation written to {out}. Review the diff, commit it, and set AEGIS_LIVE_ENABLED=1 "
+                  "on the runner only when you intend to trade live.")
         elif args.cmd == "verify":
             record = safeio.read_json(args.inp, fz.MAX_RECORD_BYTES)
             problems = sg.verify_record(record, args.purpose, fz.trusted_keys_for_repo(repo_root))

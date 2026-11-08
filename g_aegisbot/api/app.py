@@ -37,6 +37,7 @@ from g_aegisbot.db.repository import ProfileLimitError, ProfileRepository
 from g_aegisbot.db.trading_models import (
     AuditLog, Control, EquitySnapshot, Heartbeat, OpenTrade, Payment, TradeLog,
 )
+from g_aegisbot.engine import livegate
 from g_aegisbot.engine.controls import GLOBAL, ControlStore
 from g_aegisbot.exchange.key_check import check_api_key
 from g_aegisbot.services import as_utc, extend_subscription, live_switch_problems
@@ -379,6 +380,8 @@ def create_app(settings: ApiSettings, sf, box, *, authenticator: Authenticator |
                 if body.trading_mode is not None:
                     if body.trading_mode == "live" and prof.trading_mode != "live":
                         problems = live_switch_problems(prof, body.confirm_real_money, clock())
+                        problems += livegate.evaluate(params=livegate.configured_params(), profile=prof, now=clock(),
+                                                      check_switch=False).problems
                         if problems:
                             raise HTTPException(400, "Cannot switch to live: " + "; ".join(problems) + ".")
                     prof.trading_mode = body.trading_mode

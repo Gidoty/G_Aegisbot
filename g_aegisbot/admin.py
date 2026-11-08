@@ -25,6 +25,7 @@ from g_aegisbot.config import DEFAULT_COINS, DEFAULT_LEVERAGE, MAX_LEVERAGE, MIN
 from g_aegisbot.db.models import UserProfile
 from g_aegisbot.db.repository import LIVE_CREATION_MESSAGE, LiveCreationError, ProfileLimitError, ProfileRepository
 from g_aegisbot.db.trading_models import OpenTrade
+from g_aegisbot.engine import livegate
 from g_aegisbot.engine.controls import GLOBAL, ControlStore
 from g_aegisbot.security.crypto import SecretBox, generate_key
 
@@ -291,6 +292,7 @@ class Admin:
                 for msg in (KEYS_MISSING, KEYS_FUTURE, KEYS_STALE, KEYS_UNREADABLE):
                     hints[msg] = f"{msg} (run set-keys --verify)"
                 problems = [hints.get(x, x) for x in live_switch_problems(p, a.yes_real_money, self.now())]
+                problems += livegate.evaluate(params=livegate.configured_params(), profile=p, now=self.now(), check_switch=False).problems
             if problems:
                 raise AdminError("Cannot switch to live: " + "; ".join(problems) + ".")
             self.out("This account will trade REAL funds. The Binance account must be in One-way position mode, "

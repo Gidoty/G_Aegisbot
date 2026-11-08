@@ -55,6 +55,17 @@ from g_aegisbot.db.session import get_session_factory
 from g_aegisbot.security.crypto import SecretBox, generate_key
 
 
+@pytest.fixture(autouse=True)
+def _live_gate_is_open_unless_the_test_is_about_the_gate(request, monkeypatch):
+    """Most tests exercise live-mode runner and admin behaviour (stops, reconciliation, key checks) that has nothing to do with
+    strategy authorisation, so the gate is stubbed open for them. Tests marked `real_gate` (tests/test_livegate.py) get the real
+    one, and the gate's own tests prove that the real gate refuses by default."""
+    if request.node.get_closest_marker("real_gate"):
+        return
+    from g_aegisbot.engine import livegate
+    monkeypatch.setattr(livegate, "evaluate", lambda **kw: livegate.GateResult(True, [], {"stub": True}))
+
+
 @pytest.fixture
 def box():
     return SecretBox([generate_key()])
