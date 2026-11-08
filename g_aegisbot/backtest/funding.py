@@ -21,6 +21,7 @@ from pathlib import Path
 import ccxt.async_support as ccxt
 import pandas as pd
 
+from g_aegisbot.backtest import safeio
 from g_aegisbot.backtest.data import (
     DAY_MS, DataIntegrityError, DownloadError, PortfolioDownloadError, fmt_ms, with_retries,
 )
@@ -106,6 +107,7 @@ def funding_cache_path(cache_dir: str | Path, symbol: str) -> Path:
 
 
 def _write(path: Path, rows) -> None:
+    safeio.guard_write(path, overwrite=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".csv.tmp")
     pd.DataFrame(rows, columns=["timestamp", "rate"]).to_csv(tmp, index=False)
@@ -117,6 +119,7 @@ async def load_or_download_funding(exchange, symbol: str, start_ms: int, end_ms:
     path = funding_cache_path(cache_dir, symbol)
     if path.exists() and not refresh:
         try:
+            safeio.guard_read(path)
             raw = pd.read_csv(path)
             if list(raw.columns) != ["timestamp", "rate"]:
                 raise ValueError("unexpected columns")

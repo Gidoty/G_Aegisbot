@@ -33,7 +33,19 @@ from g_aegisbot.backtest.protected import assert_not_protected
 ENTRY_POINTS = ("backtest/__main__.py", "backtest/simulator.py", "backtest/acceptance_methods.py")
 # Third-party top-level imports allowed in the closure. Anything else is an unclassified dependency and fails closed.
 DECLARED_EXTERNAL = frozenset({"ccxt", "cryptography", "dotenv", "numpy", "pandas"})
-_DYNAMIC_CALLS = {"__import__", "import_module", "spec_from_file_location", "load_module"}
+# The names are written as split words so that this file does not contain the very strings its own scan refuses.
+_LITERAL_IMPORTERS = frozenset("__import__ import_module".split())
+_DYNAMIC_CALLS = _LITERAL_IMPORTERS | frozenset("spec_from_file_location load_module".split())
+# Anything that can run or load code the static analysis cannot see is refused outright, however it is spelled:
+#  * the names below as a bare reference (an alias such as `im = importlib.import_module`), an import from importlib, or a
+#    string constant (as in getattr(importlib, "import_module"));
+#  * calls to exec / eval / compile and to `.exec` / `.eval` (builtins, pandas), the modules runpy and builtins, __builtins__.
+# A name assembled at run time from pieces ("import_" + "module") cannot be found by reading the source: that residual risk
+# is stated in docs/APPROVAL_SIGNING.md, and the defence for it is to run acceptance from a clean, committed checkout.
+_DYNAMIC_NAMES = _DYNAMIC_CALLS | frozenset("spec_from_loader module_from_spec exec_module run_path run_module".split())
+_FORBIDDEN_CALLS = frozenset("exec eval compile".split())          # bare names; `re.compile` and friends are ordinary methods
+_FORBIDDEN_ATTR_CALLS = frozenset("exec eval".split())
+_FORBIDDEN_MODULES = frozenset("runpy builtins".split())
 
 
 class SourceClosureError(Exception):
@@ -52,10 +64,27 @@ def _imports_of(rel: str, tree: ast.AST, pkg: str) -> list[tuple[str, list[str]]
     """(absolute module name, imported names) for every import in the file; raises on dynamic imports."""
     out: list[tuple[str, list[str]]] = []
     here = list(PurePosixPath(rel).parent.parts)
+    call_funcs = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+
+    def refuse(node, what):
+        raise SourceClosureError(f"{rel}:{getattr(node, 'lineno', '?')} {what} cannot be analysed")
+
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Name, ast.Attribute)) and id(node) not in call_funcs:
+            name = node.id if isinstance(node, ast.Name) else node.attr
+            if name in _DYNAMIC_NAMES or name == "__builtins__":
+                refuse(node, f"a reference to {name} (it may be an alias of a dynamic loader)")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in _DYNAMIC_NAMES | _FORBIDDEN_CALLS:
+            refuse(node, f"the string {node.value!r} (it may name a dynamic loader)")
         if isinstance(node, ast.Import):
+            if any(a.name.split(".")[0] in _FORBIDDEN_MODULES for a in node.names):
+                refuse(node, "an import of runpy or builtins")
             out += [(a.name, []) for a in node.names]
         elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _FORBIDDEN_MODULES:
+                refuse(node, "an import from runpy or builtins")
+            if (node.module or "").split(".")[0] == "importlib" and any(a.name in _DYNAMIC_NAMES for a in node.names):
+                refuse(node, "an import of a dynamic loader from importlib")
             if node.level:
                 if node.level - 1 > len(here):
                     raise SourceClosureError(f"{rel}:{node.lineno} a relative import leaves the package")
@@ -67,9 +96,13 @@ def _imports_of(rel: str, tree: ast.AST, pkg: str) -> list[tuple[str, list[str]]
         elif isinstance(node, ast.Call):
             f = node.func
             called = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if isinstance(f, ast.Name) and called in _FORBIDDEN_CALLS:
+                refuse(node, f"a call to {called}()")
+            if isinstance(f, ast.Attribute) and called in _FORBIDDEN_ATTR_CALLS:
+                refuse(node, f"a call to .{called}()")
             if called in _DYNAMIC_CALLS:
                 arg = node.args[0] if node.args else None
-                if called in ("__import__", "import_module") and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if called in _LITERAL_IMPORTERS and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                     out.append((arg.value, []))
                 else:
                     raise SourceClosureError(f"{rel}:{node.lineno} dynamic import ({called}) cannot be analysed")
@@ -91,8 +124,14 @@ def closure(package_dir: str | Path, entry_points=ENTRY_POINTS, *, package_name:
             continue
         path = root / rel
         assert_not_protected(path)
+        if path.is_symlink():
+            raise SourceClosureError(f"{rel} is a symbolic link; the closure hashes only the files that are really in the package")
         if not path.is_file():
             raise SourceClosureError(f"{rel} is not a file")
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError:
+            raise SourceClosureError(f"{rel} resolves outside the package directory") from None
         try:
             data = path.read_bytes()
             tree = ast.parse(data)

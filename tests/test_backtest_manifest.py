@@ -21,6 +21,14 @@ from tests.signing_helpers import approved_repo, sign_freeze
 SYMS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
 
+@pytest.fixture(autouse=True)
+def _closure_is_committed(monkeypatch):
+    """The eligibility tests below are about OTHER conditions. Whether the working copy equals a commit is stubbed to True
+    here and tested against real temporary git repositories in test_commit_match.py."""
+    from g_aegisbot.backtest import manifest as _mf
+    monkeypatch.setattr(_mf, "code_matches_commit", lambda *a, **k: {"matches": True, "checked": 0, "mismatched": []})
+
+
 def run(tmp_path, name, *extra, seed="1", syms=SYMS):
     out = tmp_path / name
     main(["--synthetic", "--years", "0.3", "--symbols", *syms, "--seed", seed, "--out", str(out), *extra])
@@ -62,7 +70,7 @@ def test_every_saved_run_has_a_complete_manifest(tmp_path):
     assert m["code"]["files"] > 15 and len(m["code"]["sha256"]) == 64 and "backtest/simulator.py" in m["code"]["modules"]
     assert m["code"]["entry_points"] == list(__import__("g_aegisbot.backtest.source_closure", fromlist=["x"]).ENTRY_POINTS)
     assert set(m["code"]["external_versions"]) == {"ccxt", "cryptography", "dotenv", "numpy", "pandas"}
-    assert set(m["code"]["git"]) <= {"commit", "working_tree", "error"} and "dirty" not in m["code"]["git"]
+    assert set(m["code"]["git"]) <= {"commit", "working_tree", "error"} and set(m["code"]["committed"]) >= {"matches", "checked", "mismatched"} and "dirty" not in m["code"]["git"]
     assert set(m["data"]) == set(SYMS) and all(len(d["sha256"]) == 64 for d in m["data"].values())
     assert m["strategy"]["params"]["stop_atr_mult"] == 2.0 and m["config"]["use_breaker"] is True
     assert m["holdout"]["measured"]["start"] and m["holdout"]["measured"]["end"]

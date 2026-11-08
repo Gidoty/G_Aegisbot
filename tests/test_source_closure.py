@@ -185,3 +185,53 @@ def test_a_symlinked_module_to_a_protected_file_is_refused(tmp_path):
     os.symlink(tmp_path / ".env.example", root / "linked.py")
     with pytest.raises(ProtectedPathError):
         sc.closure(root, ("main.py",))
+
+
+# ---------------------------------------------------------------- bypasses found in the Phase 1 review, now refused
+@pytest.mark.parametrize("text", [
+    "from importlib import import_module as im\nim('pkg.' + 'a')\n",                  # aliased dynamic import
+    "from importlib import import_module\nimport_module('pkg.a')\n",                   # even a literal one, once it is imported by name
+    "import importlib\nim = importlib.import_module\nim('pkg.a')\n",                   # alias by assignment
+    "import importlib\nloader = getattr(importlib, 'import_module')\n",                # looked up by string
+    "exec('import pkg.a')\n",
+    "eval('1 + 1')\n",
+    "code = compile('import pkg.a', 'x', 'exec')\n",
+    "import builtins\nbuiltins.exec('x = 1')\n",
+    "__builtins__['exec']('x = 1')\n",
+    "import pandas as pd\npd.eval('1 + 1')\n",
+    "import runpy\nrunpy.run_path('pkg/a.py')\n",
+    "from runpy import run_path\n",
+    "import importlib.util\nspec = importlib.util.spec_from_file_location('m', 'a.py')\n",
+    "from importlib.util import module_from_spec\n",
+])
+def test_code_that_can_load_or_run_hidden_code_is_refused(tmp_path, text):
+    root = pkg(tmp_path, {"__init__.py": "", "main.py": text, "a.py": "x = 1\n"})
+    with pytest.raises(sc.SourceClosureError, match="cannot be analysed"):
+        sc.closure(root, ("main.py",), declared_external=frozenset({"pandas"}))
+
+
+def test_ordinary_methods_with_similar_names_are_not_refused(tmp_path):
+    root = pkg(tmp_path, {"__init__.py": "", "main.py": "import re\nimport ast\nre.compile('x')\nast.parse('1')\n"})
+    assert mods(root) == ["__init__.py", "main.py"]
+
+
+def test_a_symlinked_module_is_refused_even_to_an_innocent_file(tmp_path):
+    import os
+    root = pkg(tmp_path, {"__init__.py": "", "main.py": "import pkg.linked\n"})
+    outside = tmp_path / "outside.py"
+    outside.write_text("x = 1\n")
+    os.symlink(outside, root / "linked.py")
+    with pytest.raises(sc.SourceClosureError, match="symbolic link"):
+        sc.closure(root, ("main.py",))
+
+
+def test_a_symlinked_package_directory_pointing_outside_is_refused(tmp_path):
+    import os
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "inner.py").write_text("y = 2\n")
+    root = pkg(tmp_path, {"__init__.py": "", "main.py": "import pkg.sub.inner\n"})
+    os.symlink(outside, root / "sub")
+    (outside / "__init__.py").write_text("")
+    with pytest.raises(sc.SourceClosureError, match="outside the package"):
+        sc.closure(root, ("main.py",))

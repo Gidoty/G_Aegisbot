@@ -50,6 +50,7 @@ import numpy as np
 import pandas as pd
 
 from g_aegisbot.backtest import source_closure as sc
+from g_aegisbot.backtest import safeio
 from g_aegisbot.backtest.protected import assert_not_protected
 
 MANIFEST_VERSION = 3
@@ -102,7 +103,7 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def sha256_file(path: str | Path) -> str:
-    assert_not_protected(path)                     # before any content is read
+    path = safeio.guard_read(path)                 # protected path, link, special file or extra hard link: refused before any read
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -146,6 +147,39 @@ def git_state(repo_root: str | Path = REPO_ROOT) -> dict:
         return {"commit": commit, "working_tree": "not recorded; the code identity is the import-closure hash"}
     except Exception as exc:
         return {"commit": None, "working_tree": "not recorded", "error": f"{type(exc).__name__}"}
+
+
+def _blob_sha1(data: bytes) -> str:
+    """The id git gives a file's content (`git hash-object`), computed here so no git command has to touch the worktree."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def code_matches_commit(files, repo_root: str | Path = REPO_ROOT, package_dir: str | Path = PACKAGE_DIR) -> dict:
+    """Is every file of the import closure byte-for-byte what is committed at HEAD? `files` are the closure's paths relative
+    to the package. Only closure files are read (they can never be protected files) and git is asked only
+    `rev-parse HEAD:<path>`, which reads the object database: no status, no diff, no listing of the working tree. A file
+    that is edited, new or not committed makes the answer False. Never raises: any doubt is False.
+
+    This is what makes "run acceptance from a committed checkout" checkable: the code hash says WHAT ran, this says it is
+    exactly what the recorded commit contains, so the run can be reproduced from that commit."""
+    try:
+        root, pkg = Path(repo_root).resolve(), Path(package_dir).resolve()
+        rels = {rel: (pkg / rel).resolve().relative_to(root).as_posix() for rel in files}
+        if not rels:
+            return {"matches": False, "checked": 0, "mismatched": [], "error": "no files"}
+        local = {rel: _blob_sha1(safeio.read_bytes(pkg / rel, 8 << 20)) for rel in rels}
+        done = subprocess.run(["git", "rev-parse", *[f"HEAD:{r}" for r in rels.values()]], cwd=str(root),
+                              capture_output=True, text=True, timeout=60)
+        if done.returncode != 0:
+            return {"matches": False, "checked": len(rels), "mismatched": [],
+                    "error": "a closure file is not committed at HEAD (or git could not be asked)"}
+        committed = done.stdout.split()
+        if len(committed) != len(rels):
+            return {"matches": False, "checked": len(rels), "mismatched": [], "error": "unexpected git answer"}
+        bad = sorted(rel for rel, c in zip(rels, committed) if local[rel] != c)
+        return {"matches": not bad, "checked": len(rels), "mismatched": bad}
+    except Exception as exc:
+        return {"matches": False, "checked": 0, "mismatched": [], "error": type(exc).__name__}
 
 
 # ------------------------------------------------------------------ environment
@@ -359,6 +393,7 @@ def build_manifest(*, label: str, run_name: str, strategies, cfg, frames, fundin
                      "end": str(cfg.measure_end) if cfg.measure_end is not None else last}
     seg = segment or {"name": "full", "start": m["start"], "end": m["end"]}
 
+    committed = code_matches_commit(code["modules"], repo_root, package_dir)
     approval = fz.validate_protocol_approval(repo_root)
     exposure = fz.holdout_exposure(m["start"], m["end"], freeze_record, first, last) if m["start"] and m["end"] else \
         {"measured": m, "exposed": None, "overlaps": [], "data_overlap": None}
@@ -368,7 +403,7 @@ def build_manifest(*, label: str, run_name: str, strategies, cfg, frames, fundin
            "strategies": list(strategies), "params_sha256": strategy_section["params_sha256"], "symbols": list(frames),
            "cost_profile_values": cost_profile_values(cfg), "liquidation_file_sha256": liquidation_file_sha256, "measured": m}
     freeze_problems = (["no freeze record was supplied"] if freeze_record is None else
-                       [*fz.validate_freeze_record(freeze_record, run), *fz.freeze_signature_problems(freeze_record, repo_root)])
+                       fz.freeze_problems(freeze_record, run, repo_root))
     freeze_valid = not freeze_problems
     funding_ok = bool(fund) and cfg.funding_mode == "historical" and not cfg.funding_allow_gaps
     integrity_ok = data_integrity_passed(data_integrity, frames, excluded_symbols, synthetic, funding_ok or cfg.funding_mode != "historical")
@@ -380,6 +415,7 @@ def build_manifest(*, label: str, run_name: str, strategies, cfg, frames, fundin
         "liquidation_brackets_exact": liquidation_kind(cfg, frames.keys()) == "exact",
         "protocol_approved": approval["approved"],
         "freeze_record_valid": freeze_valid,
+        "code_matches_commit": committed["matches"],
         "acceptance_requested": bool(acceptance),
     }
     eligibility = {"synthetic_data": bool(synthetic), "data_integrity_passed": integrity_ok,
@@ -403,7 +439,7 @@ def build_manifest(*, label: str, run_name: str, strategies, cfg, frames, fundin
         "created_at": (now or datetime.now(timezone.utc)).isoformat(),
         "synthetic": bool(synthetic),
         "eligibility": eligibility,
-        "code": {**code, "git": git_state(repo_root)},
+        "code": {**code, "git": git_state(repo_root), "committed": committed},
         "environment": environment_,
         "strategy": strategy_section,
         "config": config, "config_sha256": digest(config),
@@ -440,13 +476,11 @@ def attach_outputs(manifest: dict, out_dir: str | Path) -> dict:
 def write_manifest(out_dir: str | Path, manifest: dict) -> Path:
     if sorted(manifest.get("outputs", {})) != sorted(REQUIRED_OUTPUTS):
         raise ManifestIntegrityError("the manifest must list exactly summary.json, trades.csv and equity.csv")
-    path = Path(out_dir) / MANIFEST_NAME
-    path.write_text(json.dumps(_clean(manifest), indent=2, sort_keys=True))
-    return path
+    return safeio.write_atomic(Path(out_dir) / MANIFEST_NAME, json.dumps(_clean(manifest), indent=2, sort_keys=True), overwrite=True)
 
 
 def load_manifest(out_dir: str | Path) -> dict:
-    return json.loads((Path(out_dir) / MANIFEST_NAME).read_text())
+    return json.loads(safeio.read_bytes(Path(out_dir) / MANIFEST_NAME, 8 << 20).decode("utf-8"))
 
 
 def verify_outputs(out_dir: str | Path) -> list[str]:

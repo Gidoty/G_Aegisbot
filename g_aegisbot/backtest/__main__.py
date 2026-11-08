@@ -34,6 +34,7 @@ from g_aegisbot.backtest.data import (
 from g_aegisbot.backtest.funding import download_funding_all
 from g_aegisbot.backtest.liquidation import load_liquidation_config
 from g_aegisbot.backtest import freeze as fz
+from g_aegisbot.backtest import safeio
 from g_aegisbot.backtest.manifest import (
     ARG_CLASSIFICATION, attach_outputs, build_manifest, sha256_file, write_manifest,
 )
@@ -100,11 +101,11 @@ def _save(root: Path, label: str, res, extra: dict, ctx: dict | None = None) -> 
     out = root / label
     out.mkdir(parents=True, exist_ok=True)
     conv = lambda o: None if isinstance(o, float) and math.isinf(o) else str(o)
-    (out / "summary.json").write_text(json.dumps(
+    safeio.write_atomic(out / "summary.json", json.dumps(
         {"label": label, "metrics": res.metrics, "by_strategy": res.by_strategy, "by_exit": res.by_exit,
-         "by_symbol": res.by_symbol, "notes": res.notes, **extra}, indent=2, default=conv))
-    pd.DataFrame(res.trades).to_csv(out / "trades.csv", index=False)
-    res.equity.rename("equity").to_csv(out / "equity.csv")
+         "by_symbol": res.by_symbol, "notes": res.notes, **extra}, indent=2, default=conv), overwrite=True)
+    safeio.write_atomic(out / "trades.csv", pd.DataFrame(res.trades).to_csv(index=False), overwrite=True)
+    safeio.write_atomic(out / "equity.csv", res.equity.rename("equity").to_csv(), overwrite=True)
     if ctx is not None:                      # every saved run says exactly what it was (see backtest/manifest.py)
         m = build_manifest(label=label.split("/")[0], run_name=label, data_integrity=extra.get("data_integrity"),
                            excluded_symbols=extra.get("excluded_symbols"), synthetic=bool(extra.get("synthetic")),
@@ -208,7 +209,7 @@ def acceptance_preflight(a) -> list[str]:
         except (OSError, ValueError) as exc:
             problems.append(f"the freeze record cannot be read ({type(exc).__name__})")
         else:
-            problems += [f"freeze record: {p}" for p in (*fz.validate_freeze_record(record), *fz.freeze_signature_problems(record))]
+            problems += [f"freeze record: {p}" for p in fz.freeze_problems(record)]
             a.freeze_loaded = record
     return problems
 

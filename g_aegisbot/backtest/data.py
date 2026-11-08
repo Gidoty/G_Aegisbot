@@ -28,6 +28,8 @@ import ccxt.async_support as ccxt
 import numpy as np
 import pandas as pd
 
+from g_aegisbot.backtest import safeio
+
 log = logging.getLogger("aegis.backtest.data")
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -274,6 +276,7 @@ def cache_path(cache_dir: str | Path, symbol: str, timeframe: str) -> Path:
 
 def read_cache_rows(path: Path) -> list[list]:
     """Raw rows exactly as stored, so duplicates and ordering problems stay visible."""
+    safeio.guard_read(path)
     raw = pd.read_csv(path)
     if list(raw.columns) != COLUMNS:
         raise ValueError(f"unexpected cache columns {list(raw.columns)}")
@@ -282,6 +285,7 @@ def read_cache_rows(path: Path) -> list[list]:
 
 def write_cache(path: Path, df: pd.DataFrame) -> None:
     """Write validated data atomically so an interrupted run cannot leave a half-written cache."""
+    safeio.guard_write(path, overwrite=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     out = df.copy()
     out.index = (out.index - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(milliseconds=1)

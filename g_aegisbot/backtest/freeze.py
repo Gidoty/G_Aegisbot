@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from g_aegisbot.backtest import signing
+from g_aegisbot.backtest import safeio, signing
 from g_aegisbot.backtest.manifest import PROTOCOL_DOC, REPO_ROOT, digest, sha256_file
 from g_aegisbot.backtest.protected import ProtectedPathError, assert_not_protected
 
@@ -195,14 +195,23 @@ def build_freeze_record(*, protocol_sha256: str, source_sha256: str, candidates:
     return rec
 
 
-def write_freeze_record(path: str | Path, record: dict) -> Path:
-    p = Path(path)
-    p.write_text(json.dumps(record, indent=2, sort_keys=True))
-    return p
+def write_freeze_record(path: str | Path, record: dict, *, overwrite: bool = False) -> Path:
+    """Write a freeze record atomically. Refuses protected paths, links and non-regular targets, and by default never
+    replaces an existing file: a freeze record that already exists is the frozen one. The record must be signable
+    (finite numbers, text keys, no exotic types), which is checked before anything is written."""
+    signing.canonical_bytes(record)
+    text = json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    return safeio.write_atomic(path, text, overwrite=overwrite)
 
 
 def load_freeze_record(path: str | Path) -> dict:
-    return json.loads(Path(path).read_text())
+    """Read a freeze record through the same guards as the approval record: not protected, not a link, a regular file
+    of at most MAX_RECORD_BYTES, UTF-8, strict JSON (no duplicate keys, no NaN or Infinity), and a JSON object. Raises
+    safeio.UnsafePathError, signing.SigningError or ProtectedPathError (all refusals); never returns a non-dict."""
+    data = safeio.read_json(path, MAX_RECORD_BYTES)
+    if not isinstance(data, dict):
+        raise signing.SigningError("the freeze record is not a JSON object")
+    return data
 
 
 def _hex64(v) -> bool:
@@ -275,6 +284,13 @@ def freeze_signature_problems(record, repo_root: str | Path = REPO_ROOT, now: da
 _REQUIRED = ("freeze_version", "created_at", "protocol_sha256", "source_sha256", "candidates", "universe", "periods",
              "confirmation_period_names", "methodology", "diversification_metric", "costs", "liquidation", "declaration",
              "freeze_sha256")
+
+
+def freeze_problems(record, run: dict | None = None, repo_root: str | Path = REPO_ROOT, now: datetime | None = None) -> list[str]:
+    """THE check for "this freeze record counts": structure, hash and (with `run`) match, AND the signature against the
+    pinned trusted key. Empty list = valid. Use this, not validate_freeze_record alone, wherever a freeze record decides
+    anything: validate_freeze_record does not look at the signature."""
+    return [*validate_freeze_record(record, run), *freeze_signature_problems(record, repo_root, now)]
 
 
 def validate_freeze_record(record, run: dict | None = None) -> list[str]:

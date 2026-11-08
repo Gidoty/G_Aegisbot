@@ -147,7 +147,7 @@ def test_the_manifest_process_never_reads_lists_or_mentions_protected_files(scra
     assert not any(is_protected(p) for p in opened), opened
     assert not any(is_protected(p) or p.rstrip("/") == os.path.realpath(root) for p in listed), listed     # the repo root is not even listed
     git_runs = [e[1] for e in events if e[0] == "run" and e[1][:1] == ["git"]]
-    assert git_runs == [["git", "rev-parse", "HEAD"]], events                       # the only git command, and it reads no worktree file
+    assert git_runs[0] == ["git", "rev-parse", "HEAD"] and all(r[:2] == ["git", "rev-parse"] for r in git_runs), events   # only rev-parse: reads the object database, never a worktree file
     text = json.dumps(m, default=str)
     for leak in (".env", "secrets", "server.pem", "prod.db", "wallet.key", ".ssh", "PROTECTED-CONTENT", "MODIFIED"):
         assert leak not in text, leak

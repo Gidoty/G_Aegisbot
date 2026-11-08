@@ -17,10 +17,11 @@ be supplied from Binance (`--liq-brackets file.json`); this code does not invent
 """
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+
+from g_aegisbot.backtest import safeio
 
 
 @dataclass(frozen=True)
@@ -55,21 +56,30 @@ class LiquidationModel:
     @classmethod
     def from_rows(cls, rows: list[dict], source: str) -> "LiquidationModel":
         """rows: [{"notional_cap": 50000, "mmr": 0.004, "cum": 0}, ..., {"notional_cap": null, "mmr": 0.5, "cum": 1234}]"""
-        brackets = tuple(MarginBracket(math.inf if r.get("notional_cap") in (None, "inf") else float(r["notional_cap"]),
-                                       float(r["mmr"]), float(r.get("cum", 0.0))) for r in rows)
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("liquidation brackets must be a non-empty list of rows")
+        try:
+            brackets = tuple(MarginBracket(math.inf if r.get("notional_cap") in (None, "inf") else float(r["notional_cap"]),
+                                           float(r["mmr"]), float(r.get("cum", 0.0))) for r in rows)
+        except (TypeError, ValueError, KeyError, AttributeError):
+            # fixed text on purpose: the offending value came from a file and is not echoed back
+            raise ValueError("liquidation brackets: a row is malformed (each needs numeric mmr, and notional_cap and cum "
+                             "as numbers; the last notional_cap may be null)") from None
         return cls(brackets, source)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "LiquidationModel":
-        return cls.from_rows(json.loads(Path(path).read_text()), f"brackets from {Path(path).name}")
+        return cls.from_rows(safeio.read_json(path), f"brackets from {Path(path).name}")
 
 
 def load_liquidation_config(path: str | Path) -> tuple["LiquidationModel", dict[str, "LiquidationModel"]]:
     """A JSON file with either one list of brackets (used for every symbol) or an object mapping symbols to lists,
     with an optional "default" key. Symbols not listed and no default fall back to the flat simplified model."""
-    raw = json.loads(Path(path).read_text())
+    raw = safeio.read_json(path)          # protected-path, link, size and strict-JSON checks happen before anything is parsed
     name = Path(path).name
     if isinstance(raw, list):
         return LiquidationModel.from_rows(raw, f"brackets from {name}"), {}
+    if not isinstance(raw, dict):
+        raise ValueError("the liquidation file must be a list of rows or an object of lists")
     default = LiquidationModel.from_rows(raw["default"], f"brackets from {name} (default)") if "default" in raw else LiquidationModel()
     return default, {s: LiquidationModel.from_rows(rows, f"brackets from {name} ({s})") for s, rows in raw.items() if s != "default"}

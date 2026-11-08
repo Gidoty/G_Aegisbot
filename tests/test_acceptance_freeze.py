@@ -17,6 +17,14 @@ DECL = {"by": "user", "date": "2026-11-07", "statement": "the 2019-09-08 to 2021
 
 
 # ================================================================ freeze record
+@pytest.fixture(autouse=True)
+def _closure_is_committed(monkeypatch):
+    """The eligibility tests below are about OTHER conditions. Whether the working copy equals a commit is stubbed to True
+    here and tested against real temporary git repositories in test_commit_match.py."""
+    from g_aegisbot.backtest import manifest as _mf
+    monkeypatch.setattr(_mf, "code_matches_commit", lambda *a, **k: {"matches": True, "checked": 0, "mismatched": []})
+
+
 def good_record(**over):
     kw = dict(protocol_sha256="a" * 64, source_sha256="b" * 64,
               candidates={"breakout": {"strategies": ["breakout"], "params_sha256": "c" * 64},

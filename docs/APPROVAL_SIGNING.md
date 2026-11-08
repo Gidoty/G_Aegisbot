@@ -44,3 +44,24 @@ list. A signature also does not stop a signer from approving a bad protocol.
 ## Not covered by this phase
 Signing of the evaluator's verdicts, the run register and consumption tokens, and per-candidate confirmation limits belong to
 later phases.
+
+## File access and code identity (hardening added after the Phase 1 review)
+
+**Guarded file access.** Every file the backtest tooling reads or writes by a path it is given (freeze records, liquidation
+brackets, caches, run outputs, the manifest) goes through `backtest/safeio.py`. A protected path (environment files, keys,
+credentials, databases), a symbolic link, a special file and a file with more than one hard link are refused before any
+byte is read, so an innocent name hard-linked to a secret is caught. Reads are size-bounded and JSON is strict (UTF-8, no
+duplicate keys, no NaN or Infinity). Writes are atomic; a freeze record is never overwritten unless asked, and writing
+through a link is refused. Errors never repeat file content. A race between the check and the open remains possible if
+another process can change the directory at that moment; keep the working directory writable by the operator only.
+
+**One freeze check.** `freeze.freeze_problems()` is the check that counts: structure, hash, match to the run, AND the
+signature against the pinned key. `validate_freeze_record()` alone does not look at the signature.
+
+**What the code hash proves.** `source_closure` reads the source and refuses what it cannot follow: `exec`, `eval`, bare
+`compile`, `runpy`, `builtins`, aliases of dynamic loaders (assigned, imported by name or looked up by string), symbolic
+links and files that resolve outside the package. It cannot see a loader name assembled at run time from pieces, data
+files read at run time, or the third-party libraries themselves (only their versions are recorded). The manifest therefore
+also records `code.committed`: whether every closure file is byte-for-byte what `HEAD` contains (checked with
+`git rev-parse HEAD:<path>` only, never `git status` or `git diff`). `code_matches_commit` is an acceptance condition, so an
+acceptance run needs a committed, unmodified copy of the code, and anyone can reproduce it from the recorded commit.
