@@ -81,16 +81,19 @@ switch, closes) positions in the pairs it trades, so manual trades there would b
 # as root: a service user and the code
 useradd --system --create-home --shell /usr/sbin/nologin aegis
 git clone <your repo> /opt/g-aegisbot && cd /opt/g-aegisbot && git checkout claude/awesome-volta-efmbt4
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv venv && venv/bin/pip install -r requirements.lock      # the units in deploy/ expect /opt/g-aegisbot/venv
 cp .env.example .env && chmod 600 .env && chown aegis:aegis .env   # then fill it in
 mkdir -p data && chown -R aegis:aegis data
 
 # schema: Postgres/Supabase uses migrations (SQLite creates tables itself)
-sudo -u aegis .venv/bin/python -m g_aegisbot.admin migrate
+sudo -u aegis venv/bin/python -m g_aegisbot.admin migrate
 
 # services (templates in deploy/): review them, then
 cp deploy/systemd/*.service /etc/systemd/system/ && systemctl daemon-reload
-systemctl enable --now g-aegisbot-runner g-aegisbot-api
+systemctl enable --now g-aegisbot-api
+# the runner stays OFF until docs/PRODUCTION_READINESS.md says otherwise; nightly backups:
+mkdir -p /var/backups/aegisbot && chown aegis:aegis /var/backups/aegisbot
+systemctl enable --now g-aegisbot-backup.timer
 ```
 
 Put HTTPS in front of the API (`deploy/Caddyfile`) and set `AEGIS_CORS_ORIGINS` to the dashboard URL.
@@ -147,7 +150,8 @@ Billing, and Admin (kill switch, users, audit, payments). Local development:
 4. **Paper trade for 2 to 4 weeks:** accounts in `testnet` mode use the built-in paper ledger on live
    prices. Watch the logs, the daily loss limit and the trailing stops.
 5. **Tiny real trade:** `python -m g_aegisbot.tools.selftest --mainnet --yes-real-money --notional 120`.
-6. **Live, your own account only,** with a small cap:
+6. **Live, your own account only.** Real-money entries are refused by the live gate (`docs/LIVE_GATE.md`) until a signed live
+   authorisation exists for the exact strategy, code and limits, the protocol is approved, and `AEGIS_LIVE_ENABLED=1`. With a small cap:
    ```bash
    python -m g_aegisbot.admin set-keys you@example.com --verify
    python -m g_aegisbot.admin set-cap you@example.com 200
@@ -223,7 +227,10 @@ writes no journal resolutions.
 ## Environment reference
 
 Key variables: `AEGIS_MASTER_KEYS`, `AEGIS_DATABASE_URL`, `SUPABASE_URL` or `SUPABASE_JWT_SECRET`, `SUPABASE_ANON_KEY`,
-`AEGIS_CORS_ORIGINS`, `AEGIS_STRATEGIES`, and the optional `NOWPAYMENTS_*` / `SUBSCRIPTION_*` group. Add these two lines to
+`AEGIS_CORS_ORIGINS`, `AEGIS_STRATEGIES`, `AEGIS_LIVE_ENABLED` (live gate switch, default off, see `docs/LIVE_GATE.md`),
+`AEGIS_TESTNET_ENDPOINT` (`demo`, the default, or `testnet`), the optional alert settings `AEGIS_ALERT_WEBHOOK_URL` or
+`AEGIS_ALERT_TELEGRAM_BOT_TOKEN` + `AEGIS_ALERT_TELEGRAM_CHAT_ID` and `AEGIS_ALERT_MIN_LEVEL` (`docs/PRODUCTION_READINESS.md`),
+and the optional `NOWPAYMENTS_*` / `SUBSCRIPTION_*` group. Add these two lines to
 your `.env` (and to `.env.example` as placeholders) to enable automatic first-login linking; never put a real key in the
 example file:
 

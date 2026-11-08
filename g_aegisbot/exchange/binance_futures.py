@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -118,6 +119,7 @@ class BinanceFuturesAdapter:
         *,
         testnet: bool = True,
         recv_window_ms: int = 10_000,
+        testnet_endpoint: str | None = None,
     ):
         self.testnet = testnet
         self.exchange = ccxt.binanceusdm(
@@ -133,7 +135,16 @@ class BinanceFuturesAdapter:
             }
         )
         if testnet:
-            self.exchange.set_sandbox_mode(True)
+            # Binance's current test environment for futures is "Demo Trading" (demo-fapi.binance.com, keys created in the
+            # Demo Trading section of a Binance account). The older testnet (testnet.binancefuture.com, its own keys) can be
+            # chosen with AEGIS_TESTNET_ENDPOINT=testnet. Any other value is an error, never a silent fall-back to mainnet.
+            endpoint = (testnet_endpoint or os.environ.get("AEGIS_TESTNET_ENDPOINT") or "demo").strip().lower()
+            if endpoint == "demo":
+                self.exchange.enable_demo_trading(True)
+            elif endpoint == "testnet":
+                self.exchange.set_sandbox_mode(True)
+            else:
+                raise ValueError(f"AEGIS_TESTNET_ENDPOINT must be 'demo' or 'testnet', not {endpoint!r}")
 
     @classmethod
     def from_profile(cls, profile, api_key: str, api_secret: str) -> "BinanceFuturesAdapter":

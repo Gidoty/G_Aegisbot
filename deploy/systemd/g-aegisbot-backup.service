@@ -1,0 +1,16 @@
+# Install: cp deploy/systemd/g-aegisbot-backup.* /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now g-aegisbot-backup.timer
+[Unit]
+Description=G-Aegisbot database backup
+
+[Service]
+Type=oneshot
+User=aegis
+Group=aegis
+WorkingDirectory=/opt/g-aegisbot
+EnvironmentFile=/opt/g-aegisbot/.env
+ExecStart=/opt/g-aegisbot/venv/bin/python -m g_aegisbot.tools.backup --out /var/backups/aegisbot --keep 14
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/aegisbot

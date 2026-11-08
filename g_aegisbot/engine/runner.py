@@ -1093,6 +1093,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    import os
+    from g_aegisbot import alerts
+    alerts.install(os.environ)             # CRITICAL log lines also go to AEGIS_ALERT_WEBHOOK_URL / Telegram when configured
 
     from g_aegisbot.db import get_engine, get_session_factory
     from g_aegisbot.migrate import ensure_schema

@@ -4,10 +4,13 @@ import pytest
 from g_aegisbot.exchange import BinanceFuturesAdapter
 
 
-def test_testnet_endpoints():
-    a = BinanceFuturesAdapter("k", "s", testnet=True)
-    assert "testnet.binancefuture.com" in a.exchange.urls["api"]["fapiPrivate"]
-    assert a.exchange.isSandboxModeEnabled
+def test_testnet_endpoints(monkeypatch):
+    monkeypatch.delenv("AEGIS_TESTNET_ENDPOINT", raising=False)
+    a = BinanceFuturesAdapter("k", "s", testnet=True)                      # Binance Demo Trading is the default test environment
+    assert "demo-fapi.binance.com" in a.exchange.urls["api"]["fapiPrivate"]
+    legacy = BinanceFuturesAdapter("k", "s", testnet=True, testnet_endpoint="testnet")
+    assert "testnet.binancefuture.com" in legacy.exchange.urls["api"]["fapiPrivate"]
+    assert legacy.exchange.isSandboxModeEnabled
 
 
 def test_mainnet_endpoints():

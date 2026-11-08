@@ -469,3 +469,41 @@ async def test_an_order_for_another_symbol_never_counts_as_this_symbols_stop():
     b.exchange.fetch_open_orders = mislabelled
     with pytest.raises(OrderDataError, match="different symbol"):
         await b.fetch_stop_orders(SYM)
+
+
+# ---- which Binance environment the "testnet" adapter talks to (no network: only the configured URLs are read)
+def _urls(**kw):
+    from g_aegisbot.exchange.binance_futures import BinanceFuturesAdapter
+    a = BinanceFuturesAdapter("k", "s", **kw)
+    return a, a.exchange.urls["api"]
+
+
+def test_the_testnet_adapter_uses_binance_demo_trading_by_default():
+    _, api = _urls(testnet=True)
+    assert api["fapiPrivate"].startswith("https://demo-fapi.binance.com/") and "fapi.binance.com/fapi" not in api["fapiPrivate"].replace("demo-fapi", "")
+
+
+def test_the_legacy_testnet_is_available_by_explicit_choice():
+    _, api = _urls(testnet=True, testnet_endpoint="testnet")
+    assert "testnet.binancefuture.com" in api["fapiPrivate"]
+
+
+def test_the_endpoint_can_be_chosen_from_the_environment(monkeypatch):
+    monkeypatch.setenv("AEGIS_TESTNET_ENDPOINT", "testnet")
+    assert "testnet.binancefuture.com" in _urls(testnet=True)[1]["fapiPrivate"]
+
+
+@pytest.mark.parametrize("bad", ["mainnet", "live", "", " prod ", "demo2"])
+def test_an_unknown_endpoint_is_an_error_and_never_falls_back_to_mainnet(bad, monkeypatch):
+    monkeypatch.setenv("AEGIS_TESTNET_ENDPOINT", bad)
+    if bad.strip() == "":
+        assert "demo-fapi.binance.com" in _urls(testnet=True)[1]["fapiPrivate"]          # empty means the default
+    else:
+        with pytest.raises(ValueError):
+            _urls(testnet=True)
+
+
+def test_mainnet_is_never_a_test_environment(monkeypatch):
+    monkeypatch.setenv("AEGIS_TESTNET_ENDPOINT", "testnet")
+    _, api = _urls(testnet=False)
+    assert api["fapiPrivate"].startswith("https://fapi.binance.com/")

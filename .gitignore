@@ -12,3 +12,7 @@ data/candles/
 backtests/
 data/*.db-wal
 data/*.db-shm
+venv/
+*.pem
+*.sqlite
+*.sqlite3
